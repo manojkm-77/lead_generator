@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: buyerhunter-backend
+    runtime: docker
+    dockerfilePath: ./Dockerfile.backend
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: DEBUG
+        value: "true"
+    healthCheckPath: /health
+    plan: free
