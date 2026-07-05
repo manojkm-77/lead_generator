@@ -9,6 +9,7 @@ from backend.database import init_db
 from backend.api.routes import router
 from backend.api.crm_routes import router as crm_router
 from backend.api.intelligence_routes import router as intel_router
+from backend.api.v2_routes import router as v2_router
 from backend.infrastructure.redis import get_redis, close_redis
 from backend.infrastructure.sse import get_sse_publisher
 from backend.infrastructure.worker import DiscoveryWorker
@@ -54,7 +55,13 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:3000"],
+    allow_origins=[
+        "http://localhost:5173",
+        "http://localhost:5180",
+        "http://localhost:3000",
+        "https://*.vercel.app",
+    ],
+    allow_origin_regex=r"https://.*\.(vercel\.app|onrender\.com)$",
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE"],
     allow_headers=["Authorization", "Content-Type"],
@@ -63,6 +70,7 @@ app.add_middleware(
 app.include_router(router, prefix="/api")
 app.include_router(crm_router, prefix="/api")
 app.include_router(intel_router, prefix="/api")
+app.include_router(v2_router, prefix="/api/v2")
 
 
 @app.get("/")

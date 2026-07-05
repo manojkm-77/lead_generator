@@ -182,7 +182,10 @@ export default function Pipeline() {
     setRunning(true);
     setProgress(null);
 
-    const es = new EventSource(`/api/pipeline/${runId}/stream`);
+    const sseBase = import.meta.env.VITE_API_URL
+      ? `${import.meta.env.VITE_API_URL}/api/v2`
+      : "/api/v2";
+    const es = new EventSource(`${sseBase}/pipeline/${runId}/stream`);
     eventSourceRef.current = es;
 
     es.onmessage = (event) => {
