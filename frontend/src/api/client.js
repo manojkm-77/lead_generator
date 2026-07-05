@@ -54,7 +54,7 @@ export const getTradeSummary = () => api.get("/trade-summary");
 export const startPipeline = (data) => api.post("/pipeline/start", data);
 export const getPipelineProgress = (runId) => api.get(`/pipeline/${runId}/progress`);
 export const getActivePipelines = () => api.get("/pipeline/active");
-export const expandQuery = (query) => api.get("/pipeline/expand", { params: { query } });
+export const expandQuery = (query, maxQueries) => api.get("/pipeline/expand", { params: { query, max_queries: maxQueries || 500 } });
 
 // Pipeline SSE stream
 export const streamPipeline = (runId, onMessage) => {
@@ -70,6 +70,12 @@ export const streamPipeline = (runId, onMessage) => {
   eventSource.onerror = () => eventSource.close();
   return eventSource;
 };
+
+// ── Discovery Engine ────────────────────────────────────────────────────────
+export const getDiscoverySources = () => api.get("/discovery/sources");
+export const getDiscoveryPlan = (query, maxQueries) => api.post("/discovery/plan", null, { params: { query, max_queries: maxQueries || 500 } });
+export const getDiscoveryCompanies = (runId, params) => api.get(`/discovery/companies/${runId}`, { params });
+export const getDiscoveryStats = () => api.get("/discovery/stats");
 
 // ── Analytics ────────────────────────────────────────────────────────────────
 export const getAnalyticsStates = () => api.get("/analytics/states");

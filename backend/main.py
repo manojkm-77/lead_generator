@@ -9,6 +9,10 @@ from backend.database import init_db
 from backend.api.routes import router
 from backend.api.crm_routes import router as crm_router
 from backend.api.intelligence_routes import router as intel_router
+from backend.infrastructure.redis import get_redis, close_redis
+from backend.infrastructure.sse import get_sse_publisher
+from backend.infrastructure.worker import DiscoveryWorker
+from backend.infrastructure.registry import set_worker
 
 settings = get_settings()
 
@@ -21,7 +25,24 @@ logging.basicConfig(
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
+    await get_redis()
+
+    worker = DiscoveryWorker(
+        concurrency=settings.worker_concurrency,
+        poll_interval=settings.worker_poll_interval,
+        batch_size=settings.worker_queue_batch_size,
+    )
+    set_worker(worker)
+    await worker.start()
+    logger = logging.getLogger(__name__)
+    logger.info("Infrastructure initialized (worker pool=%d)", settings.worker_concurrency)
     yield
+    w = worker
+    set_worker(None)
+    if w:
+        await w.stop()
+    await close_redis()
+    logger.info("Infrastructure shut down")
 
 
 app = FastAPI(

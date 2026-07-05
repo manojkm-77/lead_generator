@@ -29,6 +29,9 @@ requests==2.32.3
 httpx==0.28.1
 python-dateutil==2.9.0
 fake-useragent==2.0.3
+
+# Distributed Infrastructure
+redis>=5.0.0
 rapidfuzz==3.11.0
 phonenumbers==8.13.52
 email-validator==2.2.0
