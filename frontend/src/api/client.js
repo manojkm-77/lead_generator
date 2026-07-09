@@ -53,8 +53,8 @@ export const importApeda = (params) => api.post("/search", { query: "import aped
 export const importDgcis = (params) => api.post("/search", { query: "import dgcis", ...params });
 
 // ── Trade Data ───────────────────────────────────────────────────────────────
-export const getTradeData = (params) => api.get("/companies", { params });
-export const getTradeSummary = () => api.get("/stats");
+export const getTradeData = (params) => api.get("/trade-data", { params });
+export const getTradeSummary = () => api.get("/trade-summary");
 
 // ── Lead Discovery Pipeline ──────────────────────────────────────────────────
 export const startPipeline = (data) => api.post("/pipeline/start", data);

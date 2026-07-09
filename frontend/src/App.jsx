@@ -21,7 +21,6 @@ function App() {
       <Routes>
         <Route path="/" element={<Dashboard />} />
         <Route path="/search" element={<Search />} />
-        <Route path="/discovery" element={<Pipeline />} />
         <Route path="/companies" element={<Companies />} />
         <Route path="/company/:id" element={<CompanyView />} />
         <Route path="/crawls" element={<CrawlHistory />} />

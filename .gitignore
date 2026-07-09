@@ -23,3 +23,14 @@ crawl_logs/
 *.mp4
 *.avi
 *.mov
+
+# Debug / temp files
+.mimocode/
+analyze_html.py
+debug_indiamart*.py
+*_debug.html
+indiamart_dir.html
+_indiamart_dir.html
+backend/_leadtest.py
+run_pipeline_v2.py
+indiamart_product.html

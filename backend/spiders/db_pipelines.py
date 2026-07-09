@@ -12,18 +12,24 @@ logger = logging.getLogger(__name__)
 class SQLitePipeline:
     """Persist scraped items to SQLite database."""
 
-    def __init__(self, db_path):
+    def __init__(self, db_path, crawler):
         self.db_path = db_path
+        self.crawler = crawler
         self.items = []
 
     @classmethod
     def from_crawler(cls, crawler):
         db_path = crawler.settings.get("SQLITE_DB_PATH", "buyerhunter.db")
-        return cls(db_path)
+        return cls(db_path, crawler)
 
-    def open_spider(self, spider):
+    def open_spider(self, spider=None):
         import sqlite3
         self.conn = sqlite3.connect(self.db_path)
+        try:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN confidence INTEGER DEFAULT 0")
+            self.conn.commit()
+        except sqlite3.OperationalError:
+            pass
         self.conn.execute("""
             CREATE TABLE IF NOT EXISTS companies (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -40,6 +46,7 @@ class SQLitePipeline:
                 industry TEXT,
                 products TEXT,
                 lead_score INTEGER DEFAULT 0,
+                confidence INTEGER DEFAULT 0,
                 source TEXT,
                 crawl_date TEXT,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP,
@@ -72,69 +79,115 @@ class SQLitePipeline:
             )
         """)
         self.conn.commit()
-        self.open_log(spider)
+        self.open_log()
 
-    def open_log(self, spider):
+    @property
+    def _spider(self):
+        return getattr(self.crawler, "spider", None)
+
+    def open_log(self):
+        sp = self._spider
+        sp_name = sp.name if sp else "unknown"
         cursor = self.conn.execute(
-            "INSERT INTO crawl_logs (spider_name, start_time, status) VALUES (?, ?, ?)",
-            (spider.name, datetime.now(timezone.utc).isoformat(), "running"),
+            "INSERT INTO crawl_logs (spider_name, start_time, pages_crawled, companies_found, duplicates_removed, status) VALUES (?, ?, 0, 0, 0, 'running')",
+            (sp_name, datetime.now(timezone.utc).isoformat()),
         )
         self.log_id = cursor.lastrowid
         self.conn.commit()
 
-    def process_item(self, item, spider):
-        data = dict(item)
-        data.pop("_verification_issues", None)
-        data.pop("_verified", None)
-
-        # Check duplicate by name + phone
-        name = (data.get("company_name") or "").strip().lower()
+    def _insert_item(self, data: dict):
+        """Try inserting into v1 schema; fall back to v2 schema."""
+        name = (data.get("company_name") or "").strip()
         phone = data.get("phone") or ""
-        existing = self.conn.execute(
-            "SELECT id FROM companies WHERE LOWER(company_name) = ? AND phone = ?",
-            (name, phone),
-        ).fetchone()
-
-        if existing:
-            spider.stats["duplicates"] += 1
-            return item
-
         products = data.get("products")
         if isinstance(products, list):
             products = json.dumps(products)
 
-        self.conn.execute(
-            """INSERT INTO companies
-            (company_name, website, phone, whatsapp, email, address,
-             city, state, country, gst_number, industry, products,
-             lead_score, source, crawl_date)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                data.get("company_name"),
-                data.get("website"),
-                data.get("phone"),
-                data.get("whatsapp"),
-                data.get("email"),
-                data.get("address"),
-                data.get("city"),
-                data.get("state"),
-                data.get("country", "India"),
-                data.get("gst_number"),
-                data.get("industry"),
-                products,
-                data.get("lead_score", 0),
-                data.get("source"),
-                data.get("crawl_date"),
-            ),
-        )
+        v1_cols = ["company_name", "website", "phone", "whatsapp", "email",
+                   "address", "city", "state", "country", "gst_number",
+                   "industry", "products", "lead_score", "confidence", "source", "crawl_date"]
+        try:
+            self.conn.execute(
+                f"""INSERT INTO companies ({', '.join(v1_cols)})
+                VALUES ({', '.join(['?'] * len(v1_cols))})""",
+                (
+                    name, data.get("website"), phone, data.get("whatsapp"),
+                    data.get("email"), data.get("address"),
+                    data.get("city"), data.get("state"),
+                    data.get("country", "India"), data.get("gst_number"),
+                    data.get("industry"), products,
+                    data.get("lead_score", 0), data.get("confidence", 0),
+                    data.get("source"), data.get("crawl_date"),
+                ),
+            )
+        except Exception:
+            # v2 schema fallback
+            now = datetime.now(timezone.utc).isoformat()
+            self.conn.execute(
+                """INSERT INTO companies
+                (canonical_name, website_url, gst_number, industry,
+                 buyer_score, confidence, legal_status, company_tier, tier,
+                 first_seen_source, first_seen_at, created_at, updated_at,
+                 hq_city, hq_state, hq_address, hq_country, is_manufacturer,
+                 is_importer, is_exporter, is_distributor, is_wholesaler, is_retailer)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    name, data.get("website"), data.get("gst_number"),
+                    data.get("industry"), data.get("lead_score", 0), 0,
+                    "UNKNOWN", "UNKNOWN", "UNKNOWN",
+                    data.get("source") or "scrapy", now, now, now,
+                    data.get("city"), data.get("state"), data.get("address"),
+                    data.get("country", "India"),
+                    data.get("is_manufacturer", 0),
+                    data.get("is_importer", 0),
+                    data.get("is_exporter", 0),
+                    data.get("is_distributor", 0),
+                    data.get("is_wholesaler", 0),
+                    data.get("is_retailer", 0),
+                ),
+            )
+
+    def process_item(self, item, spider=None):
+        data = dict(item)
+        data.pop("_verification_issues", None)
+        data.pop("_verified", None)
+
+        name = (data.get("company_name") or "").strip().lower()
+        phone = data.get("phone") or ""
+        import sqlite3
+
+        # Check for duplicates (handle both v1 and v2 schemas)
+        try:
+            existing = self.conn.execute(
+                "SELECT id FROM companies WHERE LOWER(company_name) = ? AND phone = ?",
+                (name, phone),
+            ).fetchone()
+        except Exception:
+            try:
+                existing = self.conn.execute(
+                    "SELECT id FROM companies WHERE LOWER(canonical_name) = ?",
+                    (name,),
+                ).fetchone()
+            except Exception:
+                existing = None
+
+        if existing:
+            sp = self._spider
+            if sp:
+                sp.stats["duplicates"] += 1
+            return item
+
+        self._insert_item(data)
         self.conn.commit()
         return item
 
-    def close_spider(self, spider):
-        from scrapy.utils.python import global_object_name
+    def close_spider(self, spider=None):
+        sp = self._spider or spider
 
         end_time = datetime.now(timezone.utc).isoformat()
-        errors = json.dumps(spider.stats.get("errors", []))
+        sp_name = sp.name if sp else "unknown"
+        stats = sp.stats if sp else {"pages_crawled": 0, "companies_found": 0, "duplicates": 0, "errors": []}
+        errors = json.dumps(stats.get("errors", []))
 
         self.conn.execute(
             """UPDATE crawl_logs SET
@@ -143,11 +196,11 @@ class SQLitePipeline:
             WHERE id=?""",
             (
                 end_time,
-                spider.stats["pages_crawled"],
-                spider.stats["companies_found"],
-                spider.stats["duplicates"],
+                stats["pages_crawled"],
+                stats["companies_found"],
+                stats["duplicates"],
                 errors,
-                "completed" if not spider.stats["errors"] else "completed_with_errors",
+                "completed" if not stats["errors"] else "completed_with_errors",
                 self.log_id,
             ),
         )
@@ -155,18 +208,19 @@ class SQLitePipeline:
         self.conn.close()
 
         logger.info(
-            f"[{spider.name}] Crawl complete: "
-            f"{spider.stats['pages_crawled']} pages, "
-            f"{spider.stats['companies_found']} companies, "
-            f"{spider.stats['duplicates']} duplicates"
+            f"[{sp_name}] Crawl complete: "
+            f"{stats['pages_crawled']} pages, "
+            f"{stats['companies_found']} companies, "
+            f"{stats['duplicates']} duplicates"
         )
 
 
 class CSVExportPipeline:
     """Export scraped items to CSV file."""
 
-    def __init__(self, output_path):
+    def __init__(self, output_path, crawler):
         self.output_path = output_path
+        self.crawler = crawler
         self.file = None
         self.writer = None
 
@@ -174,19 +228,23 @@ class CSVExportPipeline:
     def from_crawler(cls, crawler):
         output_path = crawler.settings.get("CSV_OUTPUT_PATH", "exports/crawl_output.csv")
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-        return cls(output_path)
+        return cls(output_path, crawler)
 
-    def open_spider(self, spider):
+    @property
+    def _spider(self):
+        return getattr(self.crawler, "spider", None)
+
+    def open_spider(self, spider=None):
         self.file = open(self.output_path, "w", newline="", encoding="utf-8")
         fieldnames = [
             "company_name", "website", "phone", "whatsapp", "email",
             "address", "city", "state", "country", "gst_number",
-            "industry", "products", "lead_score", "source", "crawl_date",
+            "industry", "products", "lead_score", "confidence", "source", "crawl_date",
         ]
         self.writer = csv.DictWriter(self.file, fieldnames=fieldnames)
         self.writer.writeheader()
 
-    def process_item(self, item, spider):
+    def process_item(self, item, spider=None):
         data = dict(item)
         data.pop("_verification_issues", None)
         data.pop("_verified", None)
@@ -201,7 +259,9 @@ class CSVExportPipeline:
         self.writer.writerow(row)
         return item
 
-    def close_spider(self, spider):
+    def close_spider(self, spider=None):
+        sp = self._spider or spider
         if self.file:
             self.file.close()
-        logger.info(f"[{spider.name}] CSV exported to {self.output_path}")
+        sp_name = sp.name if sp else "unknown"
+        logger.info(f"[{sp_name}] CSV exported to {self.output_path}")

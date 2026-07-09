@@ -6,22 +6,22 @@ to the React frontend. Field-maps V2 models to the shapes the UI expects.
 """
 
 import asyncio
-import hashlib
 import json
 import logging
+import re
 import time
 import uuid
 from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from fastapi.responses import StreamingResponse
-from sqlalchemy import func, or_, select, text
+from fastapi.responses import Response, StreamingResponse
+from sqlalchemy import exists, func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.core.database import get_v2_db
 from backend.core.models.company import Company
-from backend.core.models.contact import Contact
+from backend.core.models.contact import Contact, ContactChannel, ContactPurpose
 from backend.core.models.evidence_ledger import EvidenceLedger
 from backend.core.models.search_jobs import SearchJob, JobStatus, JobPriority
 from backend.core.engine.intent_analyzer import IntentAnalyzer
@@ -63,6 +63,10 @@ def _company_to_frontend(c: Company, contacts: list[Contact] | None = None) -> d
             elif ct.channel == "linkedin" and not linkedin:
                 linkedin = val
 
+    # Contact person info from first contact
+    contact_person = contacts[0].person_name if contacts else ""
+    designation = contacts[0].designation if contacts else ""
+
     return {
         # Core identity
         "id": c.id,
@@ -80,6 +84,9 @@ def _company_to_frontend(c: Company, contacts: list[Contact] | None = None) -> d
         "support_email": "",
         "official_phone": official_phone,
         "whatsapp_business": whatsapp,
+        # Contact person
+        "contact_person": contact_person or "",
+        "designation": designation or "",
         # Classification
         "industry": c.industry or "",
         "sub_industry": c.sub_industry or "",
@@ -311,6 +318,46 @@ async def get_stats(db: AsyncSession = Depends(get_v2_db)):
             "source_breakdown": {}, "state_breakdown": {},
             "recent_activity": [], "recent_crawls": [],
         }
+
+
+@router.get("/trade-summary")
+async def get_trade_summary_v2():
+    """Trade summary from DGCIS trade_data table."""
+    import sqlite3
+    try:
+        conn = sqlite3.connect("buyerhunter.db")
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("""
+            SELECT hs_code, year, SUM(value_usd_million) as total_value,
+                   SUM(quantity) as total_quantity
+            FROM trade_data WHERE value_usd_million > 0
+            GROUP BY hs_code, year ORDER BY hs_code, year
+        """).fetchall()
+        conn.close()
+        return [dict(row) for row in rows]
+    except Exception:
+        return []
+
+
+@router.get("/trade-data")
+async def get_trade_data_v2(hs_code: str | None = None):
+    """Full trade data records from DGCIS."""
+    import sqlite3
+    try:
+        conn = sqlite3.connect("buyerhunter.db")
+        conn.row_factory = sqlite3.Row
+        if hs_code:
+            rows = conn.execute(
+                "SELECT * FROM trade_data WHERE hs_code = ? ORDER BY year", (hs_code,)
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM trade_data ORDER BY hs_code, year"
+            ).fetchall()
+        conn.close()
+        return [dict(row) for row in rows]
+    except Exception:
+        return []
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -559,7 +606,6 @@ _pipeline_progress: dict[str, dict] = {}
 @router.post("/search")
 async def create_search_job(
     body: dict,
-    db: AsyncSession = Depends(get_v2_db),
 ):
     """
     POST /api/v2/search — Start a new search pipeline.
@@ -607,10 +653,197 @@ async def create_search_job(
 
     # Plan queries in background
     asyncio.create_task(_execute_search_pipeline(
-        run_id, query_str, max_queries, max_pages, sources, db
+        run_id, query_str, max_queries, max_pages, sources
     ))
 
     return {"run_id": run_id, "status": "started"}
+
+
+CITY_STATES = {
+    "Mumbai": "Maharashtra",
+    "Delhi": "Delhi",
+    "Bengaluru": "Karnataka",
+    "Bangalore": "Karnataka",
+    "Hyderabad": "Telangana",
+    "Chennai": "Tamil Nadu",
+    "Kolkata": "West Bengal",
+    "Pune": "Maharashtra",
+    "Ahmedabad": "Gujarat",
+    "Surat": "Gujarat",
+    "Jaipur": "Rajasthan",
+}
+
+
+async def _crawl_and_save_job(db: AsyncSession, job: SearchJob) -> dict:
+    """Crawl a real source for a search job. Saves with full provenance."""
+    from backend.services.crawler_service import MultiSourceCrawler
+    from backend.services.pipeline_service import (
+        save_company_with_evidence,
+        save_contact_with_evidence,
+        EvidenceCategory,
+    )
+
+    city = job.target_city or "Bengaluru"
+    state = job.target_state or CITY_STATES.get(city, "Karnataka")
+    if city.lower() == "bangalore":
+        city = "Bengaluru"
+
+    crawler = MultiSourceCrawler(timeout=30, max_pages=3)
+    try:
+        result = await crawler.crawl_job(
+            query_string=job.query_string,
+            source=job.source or "justdial",
+            target_city=city,
+            target_state=state,
+        )
+    finally:
+        await crawler.close()
+
+    leads_added = 0
+    emails_added = 0
+    phones_added = 0
+    websites_added = 0
+    contacts_added = 0
+    enrichments_run = 0
+    discover_run = 0
+
+    source_name = job.source or "unknown"
+    evidence_cat = EvidenceCategory.API_RESPONSE if source_name == "indiamart" else EvidenceCategory.SCRAPED_DIRECT
+
+    for ec in result.companies:
+        company = await save_company_with_evidence(
+            db,
+            {
+                "company_name": ec.company_name,
+                "website": ec.website,
+                "city": ec.city or city,
+                "state": ec.state or state,
+                "address": ec.address or "",
+                "industry": ec.industry or "",
+                "confidence": min(90, ec.confidence or 50),
+                "buyer_score": min(90, ec.confidence or 50),
+            },
+            source=source_name,
+            source_url=ec.source_url or "",
+            scraper_name=f"crawler_{source_name}",
+            evidence_category=evidence_cat,
+        )
+        if not company:
+            continue
+
+        leads_added += 1
+        if ec.website:
+            websites_added += 1
+
+        # Save contact channels from crawler
+        if ec.email:
+            ct = await save_contact_with_evidence(
+                db, company.id, ContactChannel.EMAIL, ec.email,
+                source_url=ec.source_url or "", scraper_name=source_name,
+                purpose=ContactPurpose.GENERAL, confidence=min(90, ec.confidence or 50),
+                evidence_category=evidence_cat,
+            )
+            if ct: emails_added += 1
+        if ec.phone:
+            ct = await save_contact_with_evidence(
+                db, company.id, ContactChannel.PHONE, ec.phone,
+                source_url=ec.source_url or "", scraper_name=source_name,
+                purpose=ContactPurpose.GENERAL, confidence=min(90, ec.confidence or 50),
+                evidence_category=evidence_cat,
+            )
+            if ct: phones_added += 1
+        if ec.whatsapp:
+            await save_contact_with_evidence(
+                db, company.id, ContactChannel.WHATSAPP, ec.whatsapp,
+                source_url=ec.source_url or "", scraper_name=source_name,
+                purpose=ContactPurpose.GENERAL, confidence=min(90, ec.confidence or 50),
+                evidence_category=evidence_cat,
+            )
+
+        # Enrich company website
+        if ec.website:
+            try:
+                enrich_data = await crawler.enrich_company_website(ec.website)
+                enrichments_run += 1
+                if enrich_data.get("about_us"):
+                    company.about_us = enrich_data["about_us"]
+                if enrich_data.get("company_description"):
+                    company.company_description = enrich_data["company_description"]
+                if enrich_data.get("address") and not ec.address:
+                    company.hq_address = enrich_data["address"]
+                if enrich_data.get("city") and not ec.city:
+                    company.hq_city = enrich_data["city"]
+                if enrich_data.get("state") and not ec.state:
+                    company.hq_state = enrich_data["state"]
+
+                for e in enrich_data.get("emails", []):
+                    ct = await save_contact_with_evidence(
+                        db, company.id, ContactChannel.EMAIL, e,
+                        source_url=ec.website, scraper_name="website_enricher",
+                        purpose=ContactPurpose.OFFICIAL, confidence=60,
+                        evidence_category=EvidenceCategory.SCRAPED_DIRECT,
+                    )
+                    if ct: emails_added += 1
+                for p in enrich_data.get("phones", []):
+                    digits = re.sub(r"[^\d]", "", p)
+                    if digits:
+                        ct = await save_contact_with_evidence(
+                            db, company.id, ContactChannel.PHONE, p,
+                            source_url=ec.website, scraper_name="website_enricher",
+                            purpose=ContactPurpose.OFFICIAL, confidence=55,
+                            evidence_category=EvidenceCategory.SCRAPED_DIRECT,
+                        )
+                        if ct: phones_added += 1
+            except Exception as ex:
+                logger.debug(f"Enrichment failed for {ec.website}: {ex}")
+
+            # Contact discovery
+            try:
+                discovered = await crawler.discover_contacts(ec.website)
+                discover_run += 1
+                for dc in discovered:
+                    if not dc.person_name:
+                        continue
+                    c_confidence = min(90, dc.confidence or 50)
+                    if dc.email:
+                        ct = await save_contact_with_evidence(
+                            db, company.id, ContactChannel.EMAIL, dc.email,
+                            source_url=dc.source_url or ec.website,
+                            scraper_name="contact_discovery",
+                            person_name=dc.person_name, designation=dc.designation or "",
+                            purpose=ContactPurpose.PROCUREMENT,
+                            confidence=c_confidence,
+                            evidence_category=EvidenceCategory.SCRAPED_DIRECT,
+                        )
+                        if ct: contacts_added += 1
+                    if dc.phone:
+                        ct = await save_contact_with_evidence(
+                            db, company.id, ContactChannel.PHONE, dc.phone,
+                            source_url=dc.source_url or ec.website,
+                            scraper_name="contact_discovery",
+                            person_name=dc.person_name, designation=dc.designation or "",
+                            purpose=ContactPurpose.PROCUREMENT,
+                            confidence=c_confidence,
+                            evidence_category=EvidenceCategory.SCRAPED_DIRECT,
+                        )
+                        if ct: contacts_added += 1
+            except Exception as ex:
+                logger.debug(f"Contact discovery failed for {ec.website}: {ex}")
+
+    await db.commit()
+
+    return {
+        "leads_added": leads_added,
+        "emails_added": emails_added,
+        "phones_added": phones_added,
+        "websites_added": websites_added,
+        "contacts_added": contacts_added,
+        "pages_crawled": result.pages_crawled,
+        "enrichments_run": enrichments_run,
+        "discoveries_run": discover_run,
+        "companies_found_in_source": len(result.companies),
+        "errors": result.errors,
+    }
 
 
 async def _execute_search_pipeline(
@@ -619,7 +852,6 @@ async def _execute_search_pipeline(
     max_queries: int,
     max_pages: int,
     sources: list[str] | None,
-    db: AsyncSession,
 ):
     """Execute search pipeline in background. Updates _pipeline_progress."""
     progress = _pipeline_progress.get(run_id)
@@ -632,102 +864,155 @@ async def _execute_search_pipeline(
             "message": msg,
         })
 
+    from backend.core.database import get_session_factory
+    session_factory = get_session_factory()
+
     try:
-        # Phase 1: Intent analysis
-        progress["status"] = "planning"
-        analyzer = IntentAnalyzer()
-        intent = analyzer.analyze(query_str)
-        progress["query_type"] = intent.query_type
-        _add_msg(f"Planning search for '{query_str}' (type: {intent.query_type})")
+        async with session_factory() as db:
+            # Phase 1: Intent analysis
+            progress["status"] = "planning"
+            analyzer = IntentAnalyzer()
+            intent = analyzer.analyze(query_str)
+            progress["query_type"] = intent.query_type
+            _add_msg(f"Planning search for '{query_str}' (type: {intent.query_type})")
 
-        # Phase 2: Query expansion
-        progress["status"] = "expanding"
-        planner = HybridQueryPlanner()
-        plan = await planner.plan(query_str, max_deterministic=max_queries, max_ai=0)
+            # Phase 2: Query expansion
+            progress["status"] = "expanding"
+            planner = HybridQueryPlanner()
+            plan = await planner.plan(query_str, max_deterministic=max_queries, max_ai=0)
 
-        variations = plan.deterministic_queries
-        if sources:
-            variations = [v for v in variations if v.source in sources]
+            variations = plan.deterministic_queries
+            if sources:
+                variations = [v for v in variations if v.source in sources]
 
-        progress["total_queries"] = len(variations)
-        _add_msg(f"Generated {len(variations)} search queries across {len(set(v.source for v in variations))} sources")
+            progress["total_queries"] = len(variations)
+            _add_msg(f"Generated {len(variations)} search queries across {len(set(v.source for v in variations))} sources")
 
-        if not variations:
+            if not variations:
+                progress["status"] = "completed"
+                _add_msg("No queries generated")
+                return
+
+            # Phase 3: Create search jobs in DB
+            progress["status"] = "queuing"
+            job_ids = []
+            for v in variations:
+                job = SearchJob(
+                    query_string=v.query_string,
+                    source=v.source,
+                    status=JobStatus.PENDING,
+                    priority=JobPriority.NORMAL if v.priority < 8 else JobPriority.HIGH,
+                    max_pages=max_pages,
+                    target_state=v.target_state,
+                    target_city=v.target_city,
+                    run_id=run_id,
+                )
+                db.add(job)
+                await db.flush()
+                job_ids.append(job.id)
+
+            await db.commit()
+            progress["queued_jobs"] = len(job_ids)
+            _add_msg(f"Enqueued {len(job_ids)} search jobs")
+
+            # Phase 4: Execute jobs concurrently (max 3 at a time)
+            progress["status"] = "crawling"
+            sem = asyncio.Semaphore(3)
+
+            async def _crawl_one(idx: int, job_id: int, v: Any) -> dict:
+                async with sem:
+                    progress["current_query"] = v.query_string
+                    progress["current_source"] = v.source
+                    progress["active_jobs"] = progress.get("active_jobs", 0) + 1
+
+                    async with session_factory() as task_db:
+                        job = await task_db.get(SearchJob, job_id)
+                        if not job:
+                            progress["active_jobs"] = max(0, progress["active_jobs"] - 1)
+                            return {}
+
+                        job.status = JobStatus.RUNNING
+                        job.started_at = datetime.now(timezone.utc)
+                        await task_db.commit()
+
+                        _add_msg(f"[{idx+1}/{len(variations)}] Crawling '{v.query_string}' on {v.source}")
+                        res = {}
+                        try:
+                            res = await _crawl_and_save_job(task_db, job)
+                        except Exception as ex:
+                            logger.error(f"Failed to crawl job {job_id}: {ex}")
+                            res = {"errors": [str(ex)]}
+
+                        job.status = JobStatus.COMPLETED
+                        job.completed_at = datetime.now(timezone.utc)
+                        job.pages_crawled = res.get("pages_crawled", 0)
+                        job.companies_found = res.get("leads_added", 0)
+                        job.contacts_found = res.get("emails_added", 0) + res.get("phones_added", 0) + res.get("contacts_added", 0)
+                        await task_db.commit()
+
+                    # Update live counters immediately for SSE
+                    progress["pages_crawled"] += res.get("pages_crawled", 0)
+                    progress["companies_found"] += res.get("leads_added", 0)
+                    progress["companies_new"] += res.get("leads_added", 0)
+                    progress["emails_found"] += res.get("emails_added", 0)
+                    progress["phones_found"] += res.get("phones_added", 0)
+                    progress["websites_found"] += res.get("websites_added", 0)
+                    progress["contacts_found"] = progress.get("contacts_found", 0) + res.get("contacts_added", 0)
+                    progress["scored"] += res.get("leads_added", 0)
+                    progress["enriched"] += res.get("leads_added", 0)
+                    progress["completed_queries"] += 1
+                    progress["active_jobs"] = max(0, progress["active_jobs"] - 1)
+
+                    _add_msg(
+                        f"[{idx+1}/{len(variations)}] Done '{v.query_string}' on {v.source}: "
+                        f"{res.get('leads_added', 0)} leads, "
+                        f"{res.get('emails_added', 0)} emails, "
+                        f"{res.get('phones_added', 0)} phones"
+                    )
+                    return res
+
+            results = await asyncio.gather(*[
+                _crawl_one(i, job_ids[i], variations[i])
+                for i in range(min(len(job_ids), len(variations)))
+            ], return_exceptions=True)
+
+            # Phase 5: Dedup & merge
+            progress["status"] = "deduping"
+            _add_msg("Running deduplication...")
+            try:
+                from backend.services.pipeline_service import run_dedup_pipeline
+                dedup_result = await run_dedup_pipeline(db)
+                progress["duplicates_removed"] = dedup_result.get("removed", 0)
+                progress["merged_count"] = dedup_result.get("merged", 0)
+                progress["after_dedup"] = dedup_result.get("after_dedup", 0)
+                _add_msg(
+                    f"Dedup: {dedup_result.get('merged', 0)} merged, "
+                    f"{dedup_result.get('removed', 0)} removed, "
+                    f"{dedup_result.get('after_dedup', 0)} unique companies"
+                )
+            except Exception as ex:
+                logger.error(f"Dedup pipeline failed: {ex}")
+                _add_msg(f"Dedup failed: {ex}")
+
+            # Phase 6: Summary
             progress["status"] = "completed"
-            _add_msg("No queries generated")
-            return
-
-        # Phase 3: Create search jobs in DB
-        progress["status"] = "queuing"
-        job_ids = []
-        for v in variations:
-            job = SearchJob(
-                query_string=v.query_string,
-                source=v.source,
-                status=JobStatus.PENDING,
-                priority=JobPriority.NORMAL if v.priority < 8 else JobPriority.HIGH,
-                max_pages=max_pages,
-                target_state=v.target_state,
-                target_city=v.target_city,
-                run_id=run_id,
-            )
-            db.add(job)
-            await db.flush()
-            job_ids.append(job.id)
-
-        await db.commit()
-        progress["queued_jobs"] = len(job_ids)
-        _add_msg(f"Enqueued {len(job_ids)} search jobs")
-
-        # Phase 4: Execute jobs (simulate for now, mark as completed)
-        progress["status"] = "crawling"
-        for i, job_id in enumerate(job_ids):
-            if i >= len(variations):
-                break
-
-            v = variations[i]
-            progress["current_query"] = v.query_string
-            progress["current_source"] = v.source
-            progress["active_jobs"] = 1
-
-            # Update job status
-            job = await db.get(SearchJob, job_id)
-            if job:
-                job.status = JobStatus.RUNNING
-                job.started_at = datetime.now(timezone.utc)
-                await db.commit()
-
             _add_msg(
-                f"[{i+1}/{len(variations)}] Crawling '{v.query_string}' on {v.source}"
+                f"Pipeline complete! "
+                f"Queries: {progress['completed_queries']}/{progress['total_queries']} | "
+                f"Pages: {progress['pages_crawled']} | "
+                f"Companies found: {progress['companies_found']} | "
+                f"After dedup: {progress.get('after_dedup', progress['companies_found'])} | "
+                f"Contacts: {progress.get('contacts_found', 0)} | "
+                f"Duplicates removed: {progress.get('duplicates_removed', 0)}"
             )
-
-            # Simulate crawl time
-            await asyncio.sleep(0.1)
-
-            # Update job as completed
-            if job:
-                job.status = JobStatus.COMPLETED
-                job.completed_at = datetime.now(timezone.utc)
-                job.pages_crawled = 1
-                await db.commit()
-
-            progress["completed_queries"] = i + 1
-            progress["pages_crawled"] += 1
-
-        progress["active_jobs"] = 0
-
-        # Phase 5: Summary
-        progress["status"] = "completed"
-        _add_msg(
-            f"Pipeline complete! "
-            f"Queries: {progress['completed_queries']}/{progress['total_queries']} | "
-            f"Pages: {progress['pages_crawled']}"
-        )
 
     except Exception as e:
         progress["status"] = "failed"
         _add_msg(f"Pipeline failed: {e}")
         logger.exception(f"Pipeline {run_id} failed")
+    finally:
+        from backend.services.crawler_service import close_global_browser
+        await close_global_browser()
 
 
 @router.get("/search/{run_id}")
@@ -751,14 +1036,20 @@ async def stream_search_job(run_id: str):
                 break
 
             current_msgs = len(progress.get("messages", []))
-            if current_msgs > last_msg_count or progress["status"] in ("completed", "failed", "cancelled"):
+            elapsed = time.time() - progress.get("started_at", time.time())
+            progress["elapsed"] = elapsed
+
+            # Always push progress during crawling (emit every tick when active)
+            if (progress["status"] == "crawling" and progress.get("active_jobs", 0) > 0) \
+               or current_msgs > last_msg_count \
+               or progress["status"] in ("completed", "failed", "cancelled"):
                 yield f"data: {json.dumps(progress)}\n\n"
                 last_msg_count = current_msgs
 
             if progress["status"] in ("completed", "failed", "cancelled"):
                 break
 
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(1.0)
 
     return StreamingResponse(
         event_generator(),
@@ -776,9 +1067,9 @@ async def stream_search_job(run_id: str):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @router.post("/pipeline/start")
-async def pipeline_start_compat(body: dict, db: AsyncSession = Depends(get_v2_db)):
+async def pipeline_start_compat(body: dict):
     """Compatibility: POST /api/v2/pipeline/start → same as POST /api/v2/search"""
-    return await create_search_job(body, db)
+    return await create_search_job(body)
 
 
 @router.get("/pipeline/{run_id}/progress")
@@ -836,35 +1127,212 @@ async def pipeline_expand(
 @router.post("/export")
 async def export_data(
     format: str = Query("csv"),
-    min_score: int = Query(0),
+    search: str | None = None,
+    city: str | None = None,
+    state: str | None = None,
+    industry: str | None = None,
+    source: str | None = None,
+    min_score: int | None = None,
+    max_score: int | None = None,
+    has_email: bool | None = None,
+    has_phone: bool | None = None,
+    is_importer: bool | None = None,
+    is_exporter: bool | None = None,
+    is_manufacturer: bool | None = None,
+    is_distributor: bool | None = None,
+    is_wholesaler: bool | None = None,
+    has_website: bool | None = None,
+    sort_by: str = "created_at",
+    sort_order: str = "desc",
     db: AsyncSession = Depends(get_v2_db),
 ):
-    """Export companies as CSV/Excel/JSON."""
-    query = select(Company).where(Company.buyer_score >= min_score).order_by(Company.buyer_score.desc())
+    """Export companies with all active filters applied. No pagination — exports EVERYTHING that matches the current view."""
+    query = select(Company)
+
+    filters = []
+    if search:
+        like = f"%{search}%"
+        filters.append(or_(
+            Company.canonical_name.ilike(like),
+            Company.industry.ilike(like),
+            Company.gst_number.ilike(like),
+            Company.iec_code.ilike(like),
+            Company.hq_city.ilike(like),
+            Company.hq_state.ilike(like),
+            Company.website_url.ilike(like),
+        ))
+    if state:
+        filters.append(Company.hq_state.ilike(f"%{state}%"))
+    if city:
+        filters.append(Company.hq_city.ilike(f"%{city}%"))
+    if industry:
+        filters.append(Company.industry.ilike(f"%{industry}%"))
+    if source:
+        filters.append(Company.first_seen_source.ilike(f"%{source}%"))
+    if min_score is not None:
+        filters.append(Company.buyer_score >= min_score)
+    if max_score is not None:
+        filters.append(Company.buyer_score <= max_score)
+    if has_email:
+        filters.append(
+            exists().where(
+                Contact.company_id == Company.id,
+                Contact.channel == "email",
+                Contact.channel_value.isnot(None),
+                Contact.channel_value != "",
+            )
+        )
+    if has_phone:
+        filters.append(
+            exists().where(
+                Contact.company_id == Company.id,
+                Contact.channel == "phone",
+                Contact.channel_value.isnot(None),
+                Contact.channel_value != "",
+            )
+        )
+    if has_website:
+        filters.append(Company.website_url.isnot(None))
+        filters.append(Company.website_url != "")
+    if is_importer is not None:
+        filters.append(Company.is_importer == is_importer)
+    if is_exporter is not None:
+        filters.append(Company.is_exporter == is_exporter)
+    if is_manufacturer is not None:
+        filters.append(Company.is_manufacturer == is_manufacturer)
+    if is_distributor is not None:
+        filters.append(Company.is_distributor == is_distributor)
+    if is_wholesaler is not None:
+        filters.append(Company.is_wholesaler == is_wholesaler)
+
+    for f in filters:
+        query = query.where(f)
+
+    sort_col = getattr(Company, sort_by, Company.created_at)
+    query = query.order_by(sort_col.desc() if sort_order == "desc" else sort_col.asc())
+
     result = await db.execute(query)
     companies = result.scalars().all()
 
+    # Fetch contacts for email/phone/person display
+    company_ids = [c.id for c in companies]
+    contacts_map: dict[int, list[Contact]] = {}
+    if company_ids:
+        ct_result = await db.execute(
+            select(Contact).where(Contact.company_id.in_(company_ids))
+        )
+        for ct in ct_result.scalars().all():
+            contacts_map.setdefault(ct.company_id, []).append(ct)
+
+    items = [_company_to_frontend(c, contacts_map.get(c.id, [])) for c in companies]
+
     if format == "json":
-        items = [_company_to_frontend(c, []) for c in companies]
         return {"data": items, "count": len(items)}
 
-    # CSV fallback
+    if format == "excel":
+        return _export_excel_response(items)
+
+    return _export_csv_response(items)
+
+
+def _export_csv_response(items: list[dict]) -> Response:
+    """Generate CSV response from frontend-shaped items."""
     import csv
     import io
-    output = io.StringIO()
-    if companies:
-        fields = ["company_name", "website", "email", "phone", "industry", "city", "state", "buyer_score"]
-        writer = csv.DictWriter(output, fieldnames=fields, extrasaction="ignore")
-        writer.writeheader()
-        for c in companies:
-            row = _company_to_frontend(c, [])
-            writer.writerow({k: row.get(k, "") for k in fields})
 
-    from fastapi.responses import Response
+    fields = [
+        "company_name", "website", "industry", "products",
+        "email", "phone", "whatsapp",
+        "address", "city", "state", "country",
+        "gst_number", "iec_code", "linkedin_url",
+        "source", "lead_score",
+        "contact_person", "designation",
+        "last_verified",
+    ]
+
+    output = io.StringIO()
+    writer = csv.DictWriter(output, fieldnames=fields, extrasaction="ignore")
+    writer.writeheader()
+    for row in items:
+        out = {k: row.get(k, "") for k in fields}
+        out["contact_person"] = row.get("contact_person", "")
+        out["designation"] = row.get("designation", "")
+        out["last_verified"] = row.get("updated_at", "") or row.get("enriched_at", "") or ""
+        writer.writerow(out)
+
     return Response(
         content=output.getvalue(),
         media_type="text/csv",
-        headers={"Content-Disposition": f"attachment; filename=companies.{format}"},
+        headers={"Content-Disposition": "attachment; filename=companies.csv"},
+    )
+
+
+def _export_excel_response(items: list[dict]) -> Response:
+    """Generate Excel (.xlsx) response from frontend-shaped items."""
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment
+    import io
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Companies"
+
+    headers = [
+        "Company Name", "Website", "Industry", "Products",
+        "Contact Person", "Designation", "Email", "Phone", "WhatsApp",
+        "Address", "City", "State", "Country",
+        "GST", "IEC", "LinkedIn",
+        "Source", "Confidence Score", "Last Verified",
+    ]
+    field_keys = [
+        "company_name", "website", "industry", "products",
+        "contact_person", "designation", "email", "phone", "whatsapp",
+        "address", "city", "state", "country",
+        "gst_number", "iec_code", "linkedin_url",
+        "source", "lead_score", "last_verified",
+    ]
+
+    header_font = Font(bold=True, color="FFFFFF")
+    header_fill = PatternFill(start_color="2563EB", end_color="2563EB", fill_type="solid")
+    header_alignment = Alignment(horizontal="center", vertical="center")
+
+    ws.append(headers)
+    for col_idx in range(1, len(headers) + 1):
+        cell = ws.cell(row=1, column=col_idx)
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = header_alignment
+
+    for item in items:
+        row = []
+        for key in field_keys:
+            if key == "last_verified":
+                val = item.get("updated_at", "") or item.get("enriched_at", "") or ""
+            elif key == "contact_person":
+                val = item.get("contact_person", "")
+            elif key == "designation":
+                val = item.get("designation", "")
+            else:
+                val = item.get(key, "")
+            row.append(val)
+        ws.append(row)
+
+    for col in ws.columns:
+        max_len = 0
+        col_letter = col[0].column_letter
+        for cell in col:
+            if cell.value:
+                max_len = max(max_len, len(str(cell.value)))
+        ws.column_dimensions[col_letter].width = min(max_len + 3, 50)
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+
+    return Response(
+        content=buf.read(),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": "attachment; filename=companies.xlsx"},
     )
 
 
@@ -931,3 +1399,92 @@ async def discovery_stats(db: AsyncSession = Depends(get_v2_db)):
         select(func.count(SearchJob.id)).where(SearchJob.status == JobStatus.FAILED)
     )).scalar() or 0
     return {"total_jobs": total_jobs, "completed": completed, "failed": failed}
+
+
+@router.get("/crawl/dashboard")
+async def crawl_dashboard(db: AsyncSession = Depends(get_v2_db)):
+    """Full crawl dashboard with source breakdown, confidence, and counts."""
+    from backend.services.pipeline_service import get_crawl_dashboard
+    return await get_crawl_dashboard(db)
+
+
+@router.post("/crawl/run-source")
+async def run_source_independently(
+    source: str = Query(...),
+    query: str = Query(...),
+    city: str = Query(""),
+    db: AsyncSession = Depends(get_v2_db),
+):
+    """Run a single source crawler independently for validation."""
+    from backend.services.crawler_service import MultiSourceCrawler
+    from backend.services.pipeline_service import (
+        save_company_with_evidence,
+        save_contact_with_evidence,
+        EvidenceCategory,
+    )
+
+    start_time = datetime.now(timezone.utc)
+    crawler = MultiSourceCrawler(timeout=30, max_pages=2)
+    try:
+        result = await crawler.crawl_job(
+            query_string=query,
+            source=source,
+            target_city=city,
+            target_state="",
+        )
+    finally:
+        await crawler.close()
+
+    saved = 0
+    for ec in result.companies:
+        company = await save_company_with_evidence(
+            db, {
+                "company_name": ec.company_name,
+                "website": ec.website,
+                "city": ec.city or city,
+                "state": ec.state or "",
+                "address": ec.address or "",
+                "industry": ec.industry or "",
+                "confidence": min(90, ec.confidence or 50),
+            },
+            source=source,
+            source_url=ec.source_url or "",
+            scraper_name=f"crawler_{source}",
+            evidence_category=EvidenceCategory.SCRAPED_DIRECT,
+        )
+        if company:
+            saved += 1
+
+        if ec.email:
+            await save_contact_with_evidence(
+                db, company.id, ContactChannel.EMAIL, ec.email,
+                source_url=ec.source_url or "", scraper_name=source,
+                evidence_category=EvidenceCategory.SCRAPED_DIRECT,
+            )
+        if ec.phone:
+            await save_contact_with_evidence(
+                db, company.id, ContactChannel.PHONE, ec.phone,
+                source_url=ec.source_url or "", scraper_name=source,
+                evidence_category=EvidenceCategory.SCRAPED_DIRECT,
+            )
+
+    await db.commit()
+
+    end_time = datetime.now(timezone.utc)
+    duration_sec = (end_time - start_time).total_seconds()
+
+    return {
+        "source": source,
+        "query": query,
+        "city": city or "any",
+        "start_time": start_time.isoformat(),
+        "end_time": end_time.isoformat(),
+        "duration_seconds": round(duration_sec, 1),
+        "companies_found": len(result.companies),
+        "companies_saved": saved,
+        "pages_crawled": result.pages_crawled,
+        "errors": result.errors,
+        "success_rate": round(
+            (len(result.companies) / max(len(result.companies) + len(result.errors), 1)) * 100, 1
+        ),
+    }

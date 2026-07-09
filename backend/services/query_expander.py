@@ -930,8 +930,8 @@ class QueryExpander:
                                  "industry", "mill", "plant"]):
             return "tradeindia"
 
-        # Default: indiamart (largest B2B directory)
-        return "indiamart"
+        # Default: prefer tradeindia or justdial over indiamart (which has been unreliable)
+        return "tradeindia"
 
     def get_source_summary(self, variations: list[dict]) -> dict:
         """Get a summary of variations grouped by source."""

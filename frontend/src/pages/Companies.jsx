@@ -1,6 +1,6 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import { Link } from "react-router-dom";
-import { getCompanies, exportLeads } from "../api/client";
+import { getCompanies, getStats, exportLeads } from "../api/client";
 import { convertToLead } from "../api/crm";
 
 function ScoreBadge({ score }) {
@@ -61,6 +61,9 @@ export default function Companies() {
   const [selected, setSelected] = useState([]);
   const [showFilters, setShowFilters] = useState(false);
   const [pageSize] = useState(20);
+  const [lastRefreshed, setLastRefreshed] = useState(null);
+  const [activeCrawlers, setActiveCrawlers] = useState(0);
+  const pollRef = useRef(null);
 
   const fetchCompanies = useCallback(() => {
     setLoading(true);
@@ -68,13 +71,35 @@ export default function Companies() {
     Object.keys(params).forEach((k) => {
       if (params[k] === "" || params[k] === null || params[k] === undefined) delete params[k];
     });
-    getCompanies(params)
-      .then((r) => { setCompanies(r.data.companies); setTotal(r.data.total); })
+    Promise.all([
+      getCompanies(params),
+      getStats().catch(() => ({ data: { active_crawlers: 0 } })),
+    ])
+      .then(([cr, sr]) => {
+        setCompanies(cr.data.companies);
+        setTotal(cr.data.total);
+        setActiveCrawlers(sr.data?.active_crawlers || 0);
+        setLastRefreshed(new Date());
+      })
       .catch(() => {})
       .finally(() => setLoading(false));
   }, [page, search, filters, pageSize]);
 
   useEffect(() => { fetchCompanies(); }, [fetchCompanies]);
+
+  // Auto-poll every 15s when there may be new crawl data
+  useEffect(() => {
+    pollRef.current = setInterval(() => {
+      getStats()
+        .then((sr) => {
+          const ac = sr.data?.active_crawlers || 0;
+          setActiveCrawlers(ac);
+          if (ac > 0) fetchCompanies();
+        })
+        .catch(() => {});
+    }, 15000);
+    return () => clearInterval(pollRef.current);
+  }, [fetchCompanies]);
 
   const handleSearch = (e) => {
     setSearch(e.target.value);
@@ -110,7 +135,7 @@ export default function Companies() {
 
   const handleExport = async (format) => {
     try {
-      const params = { min_score: 0, ...filters };
+      const params = { search, ...filters };
       Object.keys(params).forEach((k) => {
         if (params[k] === "" || params[k] === null || params[k] === undefined) delete params[k];
       });
@@ -118,7 +143,7 @@ export default function Companies() {
       const url = window.URL.createObjectURL(new Blob([resp.data]));
       const a = document.createElement("a");
       a.href = url;
-      a.download = `companies.${format === "excel" ? "xlsx" : format}`;
+      a.download = `companies.${format === "excel" ? "xlsx" : "csv"}`;
       a.click();
     } catch (err) {
       alert("Export failed");
@@ -144,7 +169,23 @@ export default function Companies() {
           <h1 className="text-3xl font-bold text-gray-900 dark:text-white">Companies</h1>
           <p className="text-gray-500 dark:text-gray-400 mt-1">{total.toLocaleString()} companies across all sources</p>
         </div>
-        <div className="flex gap-2">
+        <div className="flex items-center gap-3">
+          {activeCrawlers > 0 && (
+            <span className="flex items-center gap-1.5 text-xs text-green-600 bg-green-50 dark:bg-green-900/20 dark:text-green-400 px-2.5 py-1 rounded-full">
+              <span className="w-2 h-2 bg-green-500 rounded-full animate-pulse"></span>
+              {activeCrawlers} active
+            </span>
+          )}
+          {lastRefreshed && (
+            <span className="text-xs text-gray-400 hidden lg:block">
+              Updated {lastRefreshed.toLocaleTimeString()}
+            </span>
+          )}
+          <button onClick={fetchCompanies} disabled={loading} className="btn-secondary text-sm px-3" title="Refresh">
+            <svg className={`w-4 h-4 ${loading ? 'animate-spin' : ''}`} fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+            </svg>
+          </button>
           <button onClick={() => handleExport("csv")} className="btn-secondary text-sm">
             <span className="flex items-center gap-1.5">
               <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">

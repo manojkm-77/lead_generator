@@ -119,11 +119,12 @@ class Company(V2Base):
         lazy="selectin",
     )
     evidence = relationship(
-        "EvidenceLedger", back_populates="company", cascade="all, delete-orphan",
+        "EvidenceLedger",
+        primaryjoin="and_(EvidenceLedger.entity_type == 'company', "
+                    "foreign(EvidenceLedger.entity_id) == Company.id)",
+        back_populates="company",
+        cascade="all, delete-orphan",
         lazy="noload",
-    )
-    search_jobs = relationship(
-        "SearchJob", back_populates="company", lazy="noload",
     )
 
     __table_args__ = (

@@ -165,24 +165,47 @@ def print_summary():
         today = conn.execute(
             "SELECT COUNT(*) FROM companies WHERE DATE(created_at) = DATE('now')"
         ).fetchone()[0]
-        emails = conn.execute(
-            "SELECT COUNT(*) FROM companies WHERE email IS NOT NULL AND email != ''"
-        ).fetchone()[0]
-        phones = conn.execute(
-            "SELECT COUNT(*) FROM companies WHERE phone IS NOT NULL AND phone != ''"
-        ).fetchone()[0]
-        websites = conn.execute(
-            "SELECT COUNT(*) FROM companies WHERE website IS NOT NULL AND website != ''"
-        ).fetchone()[0]
-        high_quality = conn.execute(
-            "SELECT COUNT(*) FROM companies WHERE lead_score >= 70"
-        ).fetchone()[0]
-        sources = conn.execute(
-            "SELECT source, COUNT(*) FROM companies GROUP BY source"
-        ).fetchall()
-        industries = conn.execute(
-            "SELECT industry, COUNT(*) FROM companies WHERE industry IS NOT NULL GROUP BY industry ORDER BY COUNT(*) DESC LIMIT 5"
-        ).fetchall()
+        try:
+            emails = conn.execute(
+                "SELECT COUNT(*) FROM companies WHERE email IS NOT NULL AND email != ''"
+            ).fetchone()[0]
+        except Exception:
+            emails = 0
+        try:
+            phones = conn.execute(
+                "SELECT COUNT(*) FROM companies WHERE phone IS NOT NULL AND phone != ''"
+            ).fetchone()[0]
+        except Exception:
+            phones = 0
+        try:
+            websites = conn.execute(
+                "SELECT COUNT(*) FROM companies WHERE website IS NOT NULL AND website != ''"
+            ).fetchone()[0]
+        except Exception:
+            websites = 0
+        try:
+            high_quality = conn.execute(
+                "SELECT COUNT(*) FROM companies WHERE lead_score >= 70"
+            ).fetchone()[0]
+        except Exception:
+            try:
+                high_quality = conn.execute(
+                    "SELECT COUNT(*) FROM companies WHERE buyer_score >= 70"
+                ).fetchone()[0]
+            except Exception:
+                high_quality = 0
+        try:
+            sources = conn.execute(
+                    "SELECT source, COUNT(*) FROM companies GROUP BY source"
+                ).fetchall()
+        except Exception:
+            sources = []
+        try:
+            industries = conn.execute(
+                "SELECT industry, COUNT(*) FROM companies WHERE industry IS NOT NULL GROUP BY industry ORDER BY COUNT(*) DESC LIMIT 5"
+            ).fetchall()
+        except Exception:
+            industries = []
 
         print("\n" + "=" * 60)
         print("BUYERHUNTER AI — Crawl Summary")

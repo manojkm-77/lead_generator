@@ -332,8 +332,8 @@ class SpiderRunner:
                 )
             )
 
-            # Poll DB for new companies
-            for _ in range(15):
+            # Poll DB for new companies (up to 120s)
+            for _ in range(120):
                 await asyncio.sleep(1)
                 conn = sqlite3.connect(db_path)
                 after = conn.execute("SELECT COUNT(*) FROM companies").fetchone()[0]

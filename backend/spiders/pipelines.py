@@ -3,7 +3,7 @@ from scrapy.exceptions import DropItem
 
 
 class ValidationPipeline:
-    def process_item(self, item, spider):
+    def process_item(self, item, spider=None):
         name = item.get("company_name", "").strip()
         if not name or len(name) < 2:
             raise DropItem(f"Missing company name: {item}")
@@ -13,7 +13,7 @@ class ValidationPipeline:
 
 
 class CleanupPipeline:
-    def process_item(self, item, spider):
+    def process_item(self, item, spider=None):
         fields = getattr(item, "fields", None) or list(item.keys()) if isinstance(item, dict) else []
         for field in fields:
             if field in item and isinstance(item[field], str):

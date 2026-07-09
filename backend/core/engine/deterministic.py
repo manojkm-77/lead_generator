@@ -20,20 +20,28 @@ SOURCE_CONFIGS: dict[str, dict] = {
         "priority": 10,
         "description": "India's largest B2B marketplace",
     },
-    "tradeindia": {
-        "priority": 8,
-        "description": "B2B trade directory",
-    },
     "justdial": {
         "priority": 9,
         "description": "Local business directory",
     },
-    "google_maps": {
+    "tradeindia": {
+        "priority": 8,
+        "description": "B2B trade directory",
+    },
+    "exportersindia": {
         "priority": 7,
+        "description": "Export/import trade directory",
+    },
+    "google_maps": {
+        "priority": 6,
         "description": "Business listings on Google Maps",
     },
+    "yellowpages": {
+        "priority": 5,
+        "description": "Yellow Pages business directory",
+    },
     "fssai": {
-        "priority": 6,
+        "priority": 4,
         "description": "FSSAI license registry",
     },
 }
@@ -63,34 +71,25 @@ TIER1_CITIES = [
 
 # ── Source routing rules ────────────────────────────────────────────────────
 
+# Priority order: working sources first, IndiaMART last (rate-limited)
+SOURCE_CYCLE = ["tradeindia", "justdial", "exportersindia", "google_maps", "yellowpages", "indiamart"]
+_route_counter: dict[str, int] = {}
+
 def _route_to_source(
     query_lower: str,
     business_type: str,
     product: str,
 ) -> str:
-    """Pick the best source for a given query combination."""
-    # Import/export → trade directories
-    if business_type in ("importer", "exporter", "trader"):
-        return "indiamart"
-
-    # Local businesses → justdial
-    if business_type in ("retailer", "wholesaler", "distributor"):
-        return "justdial"
-
-    # Manufacturer/processor → trade directories
-    if business_type in ("manufacturer", "processor"):
-        return "tradeindia"
-
-    # Services → justdial
-    if product in ("restaurant", "hotel"):
-        return "justdial"
-
-    # Food-grade products → check FSSAI
-    if product in ("dairy", "bakery", "snack", "confectionery", "food processing"):
-        return "indiamart"
-
-    # Default: largest B2B directory
-    return "indiamart"
+    """Distribute queries across ALL available sources.
+    Each call rotates through sources so every source gets traffic.
+    Priority: working sources first, IndiaMART last (aggressive rate limiting).
+    """
+    global _route_counter
+    key = f"{business_type}:{product}"
+    _route_counter.setdefault(key, 0)
+    _route_counter[key] += 1
+    idx = _route_counter[key] % len(SOURCE_CYCLE)
+    return SOURCE_CYCLE[idx]
 
 
 class DeterministicMatrix:
@@ -139,6 +138,8 @@ class DeterministicMatrix:
         queries: list[StructuredQuery] = []
 
         # Cross-product: product_terms × bt_variants × locations
+        # Use local counter to ensure proper source rotation
+        local_counter = 0
         for prod in product_terms[:5]:
             for bt in bt_variants:
                 for loc in locations:
@@ -146,7 +147,9 @@ class DeterministicMatrix:
                     if loc:
                         q_str += f" {loc}"
 
-                    source = _route_to_source(q_str, btype, product)
+                    # Use local counter for consistent source rotation
+                    source = SOURCE_CYCLE[local_counter % len(SOURCE_CYCLE)]
+                    local_counter += 1
                     priority = SOURCE_CONFIGS[source]["priority"]
 
                     label = f"{prod} {bt}"
@@ -172,10 +175,22 @@ class DeterministicMatrix:
                 seen.add(key)
                 unique.append(q)
 
-        # Sort by priority desc, then alphabetically
-        unique.sort(key=lambda x: (-x.priority, x.query_string))
+        # Ensure source diversity: interleave sources instead of sorting by priority
+        # Group by source
+        by_source: dict[str, list[StructuredQuery]] = {}
+        for q in unique:
+            by_source.setdefault(q.source, []).append(q)
 
-        return unique[:max_queries]
+        # Round-robin through sources to ensure diversity
+        interleaved: list[StructuredQuery] = []
+        source_lists = list(by_source.values())
+        max_per_source = (max_queries // len(source_lists)) + 1 if source_lists else max_queries
+        for i in range(max_per_source):
+            for src_list in source_lists:
+                if i < len(src_list):
+                    interleaved.append(src_list[i])
+
+        return interleaved[:max_queries]
 
     # ── Private helpers ──────────────────────────────────────────────────────
 

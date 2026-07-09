@@ -58,8 +58,11 @@ export default function TradeAnalytics() {
       getTradeSummary().catch(() => ({ data: [] })),
       getTradeData().catch(() => ({ data: [] })),
     ]).then(([s, r]) => {
-      setSummary(s.data || []);
-      setRawData(r.data || []);
+      const summaryData = Array.isArray(s.data) ? s.data : [];
+      const rawDataArr = Array.isArray(r.data) ? r.data :
+        Array.isArray(r.data?.companies) ? r.data.companies : [];
+      setSummary(summaryData);
+      setRawData(rawDataArr);
       setLoading(false);
     });
   }, []);
@@ -72,10 +75,14 @@ export default function TradeAnalytics() {
     );
   }
 
-  // Check if we have real trade data
-  const hasRealData = summary.some((r) => r.total_value > 0);
+  // Normalize arrays (API may return dict instead of array)
+  const safeSummary = Array.isArray(summary) ? summary : [];
+  const safeRaw = Array.isArray(rawData) ? rawData : [];
 
-  if (!hasRealData && summary.length > 0) {
+  // Check if we have real trade data
+  const hasRealData = safeSummary.some((r) => r && r.total_value > 0);
+
+  if (!hasRealData && safeSummary.length > 0) {
     return (
       <div className="animate-fade-in space-y-6">
         <div>
@@ -106,7 +113,8 @@ export default function TradeAnalytics() {
 
   // Process data for charts
   const yearMap = {};
-  summary.forEach((row) => {
+  safeSummary.forEach((row) => {
+    if (!row || !row.year) return;
     const yr = row.year;
     if (!yearMap[yr]) yearMap[yr] = { year: yr };
     if (row.hs_code === "1511") yearMap[yr].palmOil = row.total_value;
@@ -134,8 +142,8 @@ export default function TradeAnalytics() {
 
   // Country data from raw records (if available)
   const countryMap = {};
-  rawData.forEach((r) => {
-    if (r.country && r.value_usd_million > 0) {
+  safeRaw.forEach((r) => {
+    if (r && r.country && r.value_usd_million > 0) {
       countryMap[r.country] = (countryMap[r.country] || 0) + r.value_usd_million;
     }
   });

@@ -493,9 +493,14 @@ class SearchPlanner:
             conn = sqlite3.connect("buyerhunter.db")
             conn.row_factory = sqlite3.Row
 
-            unscored = conn.execute(
-                "SELECT COUNT(*) FROM companies WHERE lead_score = 0 AND confidence = 0"
-            ).fetchone()[0]
+            try:
+                unscored = conn.execute(
+                    "SELECT COUNT(*) FROM companies WHERE lead_score = 0 AND confidence = 0"
+                ).fetchone()[0]
+            except sqlite3.OperationalError:
+                unscored = conn.execute(
+                    "SELECT COUNT(*) FROM companies WHERE lead_score = 0"
+                ).fetchone()[0]
             if unscored == 0:
                 conn.close()
                 return 0
@@ -509,10 +514,16 @@ class SearchPlanner:
             for row in rows:
                 company = dict(row)
                 score_data = self._quick_score(company)
-                conn.execute(
-                    "UPDATE companies SET lead_score = ?, confidence = ? WHERE id = ?",
-                    (score_data["score"], score_data["confidence"], row["id"]),
-                )
+                try:
+                    conn.execute(
+                        "UPDATE companies SET lead_score = ?, confidence = ? WHERE id = ?",
+                        (score_data["score"], score_data["confidence"], row["id"]),
+                    )
+                except sqlite3.OperationalError:
+                    conn.execute(
+                        "UPDATE companies SET lead_score = ? WHERE id = ?",
+                        (score_data["score"], row["id"]),
+                    )
                 scored += 1
 
             conn.commit()

@@ -1,11 +1,11 @@
 """
 BuyerHunter AI — IndiaMART Spider
 
-Crawls dir.indiamart.com category pages using Playwright for JS rendering.
-Extracts company data from product listing cards.
+Crawls indiamart.com search results for product suppliers.
+Uses the search URL (not impcat directory) for reliable results.
 
 Usage:
-    python -m scrapy crawl indiamart -a queries='["palm oil"]' -a max_pages=2
+    python -m scrapy crawl indiamart -a queries='["palm oil buyers"]' -a max_pages=2
 """
 
 import re
@@ -19,46 +19,8 @@ import scrapy
 logger = logging.getLogger(__name__)
 
 
-# Product keyword to IndiaMART category URL mapping
-CATEGORY_MAP = {
-    "palm oil": "palm-oil",
-    "rbd palm olein": "rbd-palmolein-oil",
-    "cp10": "rbd-palmolein-oil",
-    "cp8": "rbd-palmolein-oil",
-    "sunflower oil": "sunflower-oil",
-    "soybean oil": "soyabean-oil",
-    "refined oil": "refined-oil",
-    "vegetable oil": "vegetable-oil",
-    "cooking oil": "cooking-oil",
-    "edible oil": "edib-oil",
-    "mustard oil": "mustard-oil",
-    "groundnut oil": "groundnut-oil",
-    "coconut oil": "coconut-oil",
-    "rice bran oil": "rice-bran-oil",
-    "palm stearin": "palm-stearin",
-    "palm kernel oil": "palm-kernel-oil",
-    "oleochemical": "oleochemical",
-    "glycerine": "glycerine",
-    "fatty acid": "fatty-acid",
-    "detergent": "detergent",
-    "animal feed": "animal-feed",
-    "bakery products": "bakery-products",
-    "snacks": "snacks",
-    "cosmetics": "cosmetics",
-    "vanaspati": "vanaspati-oil",
-    "shortening": "shortening-oil",
-    "bakery fat": "bakery-fat",
-    "soap": "soap-and-detergent",
-    "bakery": "bakery-products",
-    "snack": "snacks",
-    "cosmetic": "cosmetics",
-    "chocolate": "chocolate",
-    "food": "food-products",
-}
-
-
 class IndiaMARTSpider(scrapy.Spider):
-    """Crawl IndiaMART category pages for product suppliers."""
+    """Crawl IndiaMART search results for product suppliers."""
 
     name = "indiamart"
     allowed_domains = ["indiamart.com", "dir.indiamart.com"]
@@ -86,7 +48,7 @@ class IndiaMARTSpider(scrapy.Spider):
         "PLAYWRIGHT_DEFAULT_NAVIGATION_TIMEOUT": 30000,
     }
 
-    BASE_URL = "https://dir.indiamart.com/impcat"
+    SEARCH_URL = "https://www.indiamart.com/search"
 
     def __init__(self, queries=None, max_pages=3, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -110,12 +72,11 @@ class IndiaMARTSpider(scrapy.Spider):
             "errors": [],
             "start_time": datetime.now(timezone.utc).isoformat(),
         }
-        # Build start_urls from queries (works reliably on Windows)
         self.start_urls = []
         self._query_map = {}
         for query in self.queries:
-            slug = self._query_to_slug(query)
-            url = f"{self.BASE_URL}/{slug}.html"
+            params = {"q": query, "page": 1}
+            url = f"{self.SEARCH_URL}?{urlencode(params)}"
             self.start_urls.append(url)
             self._query_map[url] = query
             self.logger.info(f"[indiamart] Queued: '{query}' -> {url}")
@@ -184,7 +145,8 @@ class IndiaMARTSpider(scrapy.Spider):
         # Follow next page
         if page < self.max_pages:
             next_page = page + 1
-            next_url = f"{self.BASE_URL}/{self._query_to_slug(query)}.html?pg={next_page}"
+            params = {"q": query, "page": next_page}
+            next_url = f"{self.SEARCH_URL}?{urlencode(params)}"
             yield scrapy.Request(
                 next_url,
                 callback=self.parse_category,
@@ -195,7 +157,7 @@ class IndiaMARTSpider(scrapy.Spider):
                     "playwright_page_methods": [
                         scrapy.Request.method(
                             "wait_for_selector",
-                            "h2, [class*='card']",
+                            ".srch-rslt-itm, [class*='card'], [class*='seller']",
                             timeout=15000,
                         ),
                     ],
@@ -205,161 +167,57 @@ class IndiaMARTSpider(scrapy.Spider):
             )
 
     def _parse_html_cards(self, response, query):
-        """Parse company data from template7 seller info cards."""
-        seller_cards = response.css(".template7-seller-info")
-        if not seller_cards:
-            seller_cards = response.css("[class*='seller-info']")
-
+        """Parse company data from IndiaMART search result cards."""
+        seller_cards = response.css(".srch-rslt-itm, [class*='seller-info'], [class*='card']")
         seen_companies = set()
         for card in seller_cards:
-            # Get seller name from the card
-            name_el = card.css(".wlc1 a::text, a::text").get()
+            name_el = card.css("h2::text, [class*='name'] a::text, a[href*='supplier']::text").get()
             if not name_el:
-                name_el = card.css("::text").get()
+                name_el = card.css("[class*='title']::text").get()
             if not name_el:
                 continue
-
             company_name = name_el.strip()
             if not company_name or len(company_name) < 3 or company_name in seen_companies:
                 continue
             seen_companies.add(company_name)
-
-            # Get location and years from seller row
-            row_text = card.css(".template7-seller-row ::text").getall()
-            full_text = " ".join(t.strip() for t in row_text if t.strip())
-
-            # Parse location and years
-            location = ""
-            years = ""
-            loc_match = re.search(r'([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*(?:,\s*[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)*)\s*·\s*(\d+\s*(?:yrs?|Months?|yr))', full_text)
-            if loc_match:
-                location = loc_match.group(1).strip()
-                years = loc_match.group(2).strip()
-            else:
-                # Try simpler pattern
-                parts = full_text.split("·")
-                if len(parts) >= 2:
-                    location = parts[0].strip().split(company_name)[-1].strip()
-                    years = parts[1].strip()
-
-            parsed_city, parsed_state = self._parse_location(location)
-
-            # Get product name from the parent card (template7-card-meta)
-            parent = card.xpath("..")
-            product = parent.css("h2::text").get() or ""
-            product = product.strip()
-
-            # Get price
-            price = parent.css("[class*='price'] ::text, .prc ::text").get() or ""
-            price = price.strip()
-
+            location_text = card.css("[class*='loc']::text, span[class*='city']::text, [class*='address']::text").get()
+            location = location_text.strip() if location_text else None
+            city, state = self._parse_location(location)
+            product = card.css("h2::text, [class*='product']::text").get()
+            product = product.strip() if product else ""
             yield {
                 "company_name": company_name,
-                "website": None,
-                "phone": None,
-                "whatsapp": None,
-                "email": None,
-                "address": None,
-                "city": parsed_city,
-                "state": parsed_state,
-                "country": "India",
-                "gst_number": None,
-                "industry": self._guess_industry(query),
+                "website": None, "phone": None, "whatsapp": None, "email": None,
+                "address": None, "city": city, "state": state, "country": "India",
+                "gst_number": None, "industry": self._guess_industry(query),
                 "products": json.dumps([product]) if product else None,
-                "lead_score": 0,
-                "source": "indiamart",
+                "lead_score": 0, "source": "indiamart",
                 "crawl_date": datetime.now(timezone.utc).isoformat(),
-                "about_us": f"Product: {product}. Price: {price}. Years: {years}" if years else None,
             }
 
-    def _parse_seller_text(self, text):
-        """Parse company name, city, and years from seller text."""
-        if not text:
-            return None, None, None
-
-        text = text.strip()
-        # Pattern: "CompanyName City · X yrs" or "CompanyNameCity · X yrs"
-        match = re.match(r'^(.+?)(?:\s{2,}|\n)(.+?)(?:\s*·\s*(\d+\s*(?:yrs?|Months?|yr)))?$', text)
-        if match:
-            return match.group(1).strip(), match.group(2).strip(), match.group(3)
-
-        # Try without years
-        parts = text.split("·")
-        name_part = parts[0].strip()
-
-        # Try to split name and city
-        for sep in ["  ", "\t"]:
-            if sep in name_part:
-                parts2 = name_part.split(sep, 1)
-                return parts2[0].strip(), parts2[1].strip(), parts[1].strip() if len(parts) > 1 else None
-
-        return name_part, None, parts[1].strip() if len(parts) > 1 else None
-
     def _parse_location(self, text):
-        """Parse city and state from location text."""
         if not text:
             return None, None
-
-        text = re.sub(r'\s*·\s*\d+.*$', '', text).strip()
         parts = [p.strip() for p in text.split(",")]
         city = parts[0] if parts else None
         state = parts[-1] if len(parts) > 1 and len(parts[-1]) > 3 else None
         return city, state
 
     def _build_item(self, data, query):
-        """Build a company item from extracted data."""
         name = data.get("seller", "").strip()
         if not name or len(name) < 3:
             return None
-
         location = data.get("location", "")
         city, state = self._parse_location(location)
-
         return {
-            "company_name": name,
-            "website": None,
-            "phone": None,
-            "whatsapp": None,
-            "email": None,
-            "address": None,
-            "city": city,
-            "state": state,
-            "country": "India",
-            "gst_number": None,
-            "industry": self._guess_industry(query),
+            "company_name": name, "website": None, "phone": None,
+            "whatsapp": None, "email": None, "address": None,
+            "city": city, "state": state, "country": "India",
+            "gst_number": None, "industry": self._guess_industry(query),
             "products": json.dumps([data.get("product", "")]),
-            "lead_score": 0,
-            "source": "indiamart",
+            "lead_score": 0, "source": "indiamart",
             "crawl_date": datetime.now(timezone.utc).isoformat(),
         }
-
-    def _query_to_slug(self, query):
-        """Convert a search query to an IndiaMART category slug."""
-        q = query.lower().strip()
-
-        # Remove common suffixes
-        clean = re.sub(r'\b(manufacturer|supplier|distributor|dealer|wholesaler|retailer|importer|exporter|company|companies|india|products?)\b', '', q).strip()
-        clean = re.sub(r'\s+', ' ', clean).strip()
-
-        # Direct lookup
-        if clean in CATEGORY_MAP:
-            return CATEGORY_MAP[clean]
-        if q in CATEGORY_MAP:
-            return CATEGORY_MAP[q]
-
-        # Partial match - check if any keyword matches
-        best_match = None
-        best_len = 0
-        for keyword, slug in CATEGORY_MAP.items():
-            if keyword in clean and len(keyword) > best_len:
-                best_match = slug
-                best_len = len(keyword)
-
-        if best_match:
-            return best_match
-
-        # Default: slugify the query
-        return re.sub(r'[^a-z0-9]+', '-', clean).strip('-')
 
     def _guess_industry(self, query):
         q = query.lower()

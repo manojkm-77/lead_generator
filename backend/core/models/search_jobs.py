@@ -73,7 +73,9 @@ class SearchJob(V2Base):
     pages_crawled: Mapped[int] = mapped_column(Integer, default=0)
     companies_found: Mapped[int] = mapped_column(Integer, default=0)
     contacts_found: Mapped[int] = mapped_column(Integer, default=0)
-    errors: Mapped[dict | None] = mapped_column(JSONB)
+    errors: Mapped[dict | None] = mapped_column(
+        JSONB().with_variant(Text, "sqlite")
+    )
 
     # Geography
     target_state: Mapped[str | None] = mapped_column(Text)
@@ -101,9 +103,6 @@ class SearchJob(V2Base):
     )
 
     # Relationships
-    company = relationship(
-        "Company", back_populates="search_jobs", lazy="noload",
-    )
     parent_job = relationship(
         "SearchJob", remote_side=[id], lazy="noload",
     )

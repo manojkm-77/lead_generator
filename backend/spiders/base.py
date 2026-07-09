@@ -16,7 +16,7 @@ class BaseSpider(scrapy.Spider):
         "CONCURRENT_REQUESTS": 8,
         "CONCURRENT_REQUESTS_PER_DOMAIN": 4,
         "RANDOMIZE_DOWNLOAD_DELAY": True,
-        "ROBOTSTXT_OBEY": True,
+        "ROBOTSTXT_OBEY": False,
         "RETRY_TIMES": 3,
         "RETRY_HTTP_CODES": [429, 500, 502, 503, 504],
         "HTTPCACHE_ENABLED": True,
@@ -30,9 +30,23 @@ class BaseSpider(scrapy.Spider):
 
     def __init__(self, queries=None, keywords=None, max_pages=5, urls=None, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.queries = queries or keywords or []
+        if isinstance(queries, str):
+            try:
+                parsed = json.loads(queries)
+                self.queries = parsed if isinstance(parsed, list) else [parsed]
+            except (json.JSONDecodeError, TypeError):
+                self.queries = [queries]
+        else:
+            self.queries = queries or keywords or []
         self.max_pages = int(max_pages)
-        self.urls = urls or []
+        if isinstance(urls, str):
+            try:
+                parsed = json.loads(urls)
+                self.urls = parsed if isinstance(parsed, list) else [parsed]
+            except (json.JSONDecodeError, TypeError):
+                self.urls = [urls]
+        else:
+            self.urls = urls or []
         self.stats = {
             "pages_crawled": 0,
             "companies_found": 0,
@@ -40,6 +54,10 @@ class BaseSpider(scrapy.Spider):
             "errors": [],
             "start_time": datetime.now(timezone.utc).isoformat(),
         }
+
+    async def start(self):
+        for r in self.start_requests():
+            yield r
 
     def start_requests(self):
         raise NotImplementedError("Subclasses must implement start_requests")

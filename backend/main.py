@@ -6,6 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from backend.config import get_settings
 from backend.database import init_db
+from backend.core.database import init_v2_db
 from backend.api.routes import router
 from backend.api.crm_routes import router as crm_router
 from backend.api.intelligence_routes import router as intel_router
@@ -26,6 +27,7 @@ logging.basicConfig(
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
+    await init_v2_db()
     await get_redis()
 
     worker = DiscoveryWorker(
