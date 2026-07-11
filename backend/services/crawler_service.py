@@ -18,7 +18,13 @@ from urllib.parse import quote_plus, urlencode
 import httpx
 from bs4 import BeautifulSoup
 
-from playwright.async_api import async_playwright, TimeoutError as PWTimeout
+try:
+    from playwright.async_api import async_playwright, TimeoutError as PWTimeout
+    _PLAYWRIGHT_AVAILABLE = True
+except Exception:
+    async_playwright = None
+    PWTimeout = Exception
+    _PLAYWRIGHT_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
@@ -31,10 +37,13 @@ USER_AGENTS = [
 
 _BROWSER = None
 _PLAY = None
+_PLAYWRIGHT_ERROR = "Playwright is not available in this deployment. Install playwright and run 'playwright install chromium' for JS-heavy crawlers, or use httpx-only sources."
 
 
 async def _get_playwright():
     global _PLAY
+    if not _PLAYWRIGHT_AVAILABLE:
+        raise RuntimeError(_PLAYWRIGHT_ERROR)
     if _PLAY is None:
         _PLAY = await async_playwright().start()
     return _PLAY
@@ -44,14 +53,17 @@ async def _get_browser():
     global _BROWSER
     if _BROWSER is None or not _BROWSER.is_connected():
         pw = await _get_playwright()
-        _BROWSER = await pw.chromium.launch(
-            headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-blink-features=AutomationControlled",
-                "--disable-dev-shm-usage",
-            ],
-        )
+        try:
+            _BROWSER = await pw.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-blink-features=AutomationControlled",
+                    "--disable-dev-shm-usage",
+                ],
+            )
+        except Exception as e:
+            raise RuntimeError(f"{_PLAYWRIGHT_ERROR} (launch failed: {e})")
     return _BROWSER
 
 
@@ -158,6 +170,8 @@ class MultiSourceCrawler:
         return None
 
     async def _pw_page(self):
+        if not _PLAYWRIGHT_AVAILABLE:
+            raise RuntimeError(_PLAYWRIGHT_ERROR)
         browser = await _get_browser()
         context = await browser.new_context(
             user_agent=random.choice(USER_AGENTS),
@@ -169,7 +183,6 @@ class MultiSourceCrawler:
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             },
         )
-        # Add stealth scripts to avoid bot detection
         await context.add_init_script("""
             Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
             window.chrome = { runtime: {} };
