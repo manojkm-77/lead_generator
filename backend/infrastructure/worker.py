@@ -169,8 +169,9 @@ class DiscoveryWorker:
         await self.sse.increment(active_workers=-1)
 
     async def _process_url(self, worker_id: int, job):
-        from backend.database import async_session
-        from backend.models.company import Company
+        from backend.core.database import get_session_factory
+        from backend.core.models.company import Company
+        from backend.core.models.contact import Contact, ContactChannel, ContactPurpose
 
         parsed = urlparse(job.url)
         domain = parsed.netloc or parsed.hostname or ""
@@ -219,34 +220,60 @@ class DiscoveryWorker:
 
             contacts_extracted = len(emails) + len(phones)
 
-            async with async_session() as db:
+            factory = get_session_factory()
+            async with factory() as db:
                 existing = await db.execute(
-                    select(Company).where(Company.website == job.url)
+                    select(Company).where(Company.website_url == job.url)
                 )
                 existing_company = existing.scalar_one_or_none()
 
                 if existing_company:
                     logger.debug("Worker %d found existing company for %s", worker_id, job.url)
-                    if emails and not existing_company.email:
-                        existing_company.email = emails[0]
-                    if phones and not existing_company.phone:
-                        existing_company.phone = phones[0]
+                    for email in emails:
+                        db.add(Contact(
+                            company_id=existing_company.id,
+                            channel=ContactChannel.EMAIL,
+                            channel_value=email,
+                            channel_purpose=ContactPurpose.GENERAL,
+                            confidence=60,
+                        ))
+                    for phone in phones:
+                        db.add(Contact(
+                            company_id=existing_company.id,
+                            channel=ContactChannel.PHONE,
+                            channel_value=phone,
+                            channel_purpose=ContactPurpose.GENERAL,
+                            confidence=60,
+                        ))
                     await db.commit()
                     await self.sse.increment(companies_saved=0)
                 else:
                     company = Company(
-                        company_name=company_name[:255],
-                        website=job.url[:500],
-                        email=emails[0] if emails else "",
-                        phone=phones[0] if phones else "",
-                        about_us=description,
-                        source=job.source or "discovery_worker",
-                        source_url=job.url,
-                        city=job.metadata.get("city", ""),
-                        state=job.metadata.get("state", ""),
+                        canonical_name=company_name[:255],
+                        website_url=job.url[:500],
                         industry=job.metadata.get("industry", ""),
+                        hq_city=job.metadata.get("city", ""),
+                        hq_state=job.metadata.get("state", ""),
+                        first_seen_source=job.source or "discovery_worker",
                     )
                     db.add(company)
+                    await db.flush()
+                    for email in emails:
+                        db.add(Contact(
+                            company_id=company.id,
+                            channel=ContactChannel.EMAIL,
+                            channel_value=email,
+                            channel_purpose=ContactPurpose.GENERAL,
+                            confidence=60,
+                        ))
+                    for phone in phones:
+                        db.add(Contact(
+                            company_id=company.id,
+                            channel=ContactChannel.PHONE,
+                            channel_value=phone,
+                            channel_purpose=ContactPurpose.GENERAL,
+                            confidence=60,
+                        ))
                     await db.commit()
                     await self.sse.increment(companies_saved=1)
 

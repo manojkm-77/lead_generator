@@ -8,7 +8,20 @@ services:
         sync: false
       - key: GEMINI_API_KEY
         sync: false
+      - key: WHATSAPP_API_TOKEN
+        sync: false
+      - key: WHATSAPP_PHONE_NUMBER_ID
+        sync: false
+      - key: WHATSAPP_BUSINESS_ACCOUNT_ID
+        sync: false
       - key: DEBUG
-        value: "true"
+        value: "false"
+      - key: REDIS_ENABLED
+        value: "false"
+      - key: API_HOST
+        value: "0.0.0.0"
+      - key: API_PORT
+        value: "8000"
     healthCheckPath: /health
     plan: free
+    autoDeploy: true

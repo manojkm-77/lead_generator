@@ -23,8 +23,8 @@ _engine = None
 _session_factory = None
 
 
-def _is_sqlite(url: str) -> bool:
-    return url.startswith("sqlite") or url.startswith("sqlite+aiosqlite")
+def _is_sqlite(url) -> bool:
+    return str(url).startswith("sqlite") or str(url).startswith("sqlite+aiosqlite")
 
 
 def get_engine():
@@ -75,19 +75,20 @@ async def init_v2_db():
 
     engine = get_engine()
     async with engine.begin() as conn:
-        def _reset_legacy_tables(sync_conn):
-            rows = sync_conn.execute(
-                text("SELECT name FROM sqlite_master WHERE type='table' AND name='companies'")
-            ).fetchall()
-            if not rows:
-                return
-            existing_cols = [
-                r[0] for r in sync_conn.execute(text("PRAGMA table_info(companies)")).fetchall()
-            ]
-            if "canonical_name" not in existing_cols:
-                # Legacy V1 schema occupying V2 table names — drop colliding tables.
-                for t in ("companies", "contacts", "search_jobs", "evidence_ledger"):
-                    sync_conn.execute(text(f"DROP TABLE IF EXISTS {t}"))
+        if _is_sqlite(engine.url):
+            def _reset_legacy_tables(sync_conn):
+                rows = sync_conn.execute(
+                    text("SELECT name FROM sqlite_master WHERE type='table' AND name='companies'")
+                ).fetchall()
+                if not rows:
+                    return
+                existing_cols = [
+                    r[0] for r in sync_conn.execute(text("PRAGMA table_info(companies)")).fetchall()
+                ]
+                if "canonical_name" not in existing_cols:
+                    for t in ("companies", "contacts", "search_jobs", "evidence_ledger"):
+                        sync_conn.execute(text(f"DROP TABLE IF EXISTS {t}"))
 
-        await conn.run_sync(_reset_legacy_tables)
+            await conn.run_sync(_reset_legacy_tables)
+
         await conn.run_sync(V2Base.metadata.create_all)
