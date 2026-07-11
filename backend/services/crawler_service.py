@@ -139,17 +139,21 @@ class MultiSourceCrawler:
             try:
                 resp = await client.get(url, headers=h)
                 if resp.status_code == 429:
+                    logger.warning(f"HTTP 429 for {url} (attempt {attempt+1}/3)")
                     await asyncio.sleep((attempt + 1) * 5)
                     continue
                 if resp.status_code == 200:
                     return resp.text
+                logger.warning(f"HTTP {resp.status_code} for {url}")
                 return None
-            except (httpx.ConnectError, httpx.RemoteProtocolError, httpx.ReadTimeout):
+            except (httpx.ConnectError, httpx.RemoteProtocolError, httpx.ReadTimeout) as e:
+                logger.warning(f"HTTP connection error for {url}: {e} (attempt {attempt+1}/3)")
                 if attempt < 2:
                     await asyncio.sleep((attempt + 1) * 3)
                     continue
                 return None
-            except Exception:
+            except Exception as e:
+                logger.warning(f"HTTP unexpected error for {url}: {e}")
                 return None
         return None
 
@@ -184,10 +188,11 @@ class MultiSourceCrawler:
         except PWTimeout:
             try:
                 return await page.content()
-            except Exception:
+            except Exception as e2:
+                logger.warning(f"PW goto timeout for {url}: {e2}")
                 return None
         except Exception as e:
-            logger.debug(f"PW goto failed for {url}: {e}")
+            logger.warning(f"PW goto failed for {url}: {e}")
             return None
 
     def _clean(self, text) -> str:
@@ -240,188 +245,157 @@ class MultiSourceCrawler:
             coro = self.crawl_tradeindia
         return coro(query_string, target_city, target_state)
 
-    # ─── TradeIndia (Playwright - works) ───────────────────────────────
+    # ─── TradeIndia (Playwright) ────────────────────────────────────────
 
     async def crawl_tradeindia(self, query: str, city: str = "", state: str = "") -> CrawlResult:
         result = CrawlResult()
         try:
             page, ctx = await self._pw_page()
-            params = {"keyword": query, "page": 1}
+            params = {"keyword": query}
+            if city:
+                params["city"] = city
             url = f"https://www.tradeindia.com/search.html?{urlencode(params)}"
             html = await self._pw_goto(page, url)
-            if html:
-                soup = BeautifulSoup(html, "lxml")
-                seen = set()
-                profile_links = []
+            if not html:
+                logger.warning(f"TradeIndia: empty HTML for {url}")
+                await ctx.close()
+                return result
 
-                # Try multiple selector strategies for TradeIndia
-                cards = soup.select(
-                    "div.product-card, "              # Product cards
-                    "div[class*='seller'], "          # Seller cards
-                    "div[class*='company'], "         # Company cards
-                    "div[class*='listing'], "         # Listing cards
-                    "div[class*='result'], "          # Result cards
-                    "div.fr, "                        # TradeIndia specific
-                    "div.rl"                          # TradeIndia specific
+            soup = BeautifulSoup(html, "lxml")
+            seen = set()
+            profile_links: list[tuple[str, str]] = []
+
+            cards = soup.select("div.card")
+            if not cards:
+                logger.warning(f"TradeIndia: no div.card found for {url} (html len={len(html)})")
+
+            for card in cards:
+                # Company profile link (ends with -digits/)
+                comp_link = card.select_one("a[href*='tradeindia.com/'][href*='-']")
+                comp_href = comp_link.get("href", "") if comp_link else ""
+                if not re.search(r"-\d+/$", comp_href):
+                    comp_link = None
+
+                # Company name
+                name_el = (
+                    card.select_one("h3.coy-name") or
+                    card.select_one("h3[class*='coy']")
                 )
+                if not name_el and comp_link:
+                    name_el = comp_link
+                if not name_el:
+                    continue
+                name = self._clean(name_el.get_text())
+                # Strip "X Years" suffix if present
+                name = re.sub(r"\s+\d+\s*Years$", "", name).strip()
+                if not name or len(name) < 3:
+                    continue
+                if name.lower() in seen:
+                    continue
+                seen.add(name.lower())
 
-                for card in cards:
-                    name_el = (
-                        card.select_one("h2 a") or
-                        card.select_one("h3 a") or
-                        card.select_one("[class*='name'] a") or
-                        card.select_one("a[href*='company']") or
-                        card.select_one("[class*='title']") or
-                        card.select_one("h2") or
-                        card.select_one("h3")
-                    )
-                    if not name_el:
+                # Product title (for context, not stored as company)
+                title_el = card.select_one("h2")
+                _title = self._clean(title_el.get_text()) if title_el else ""
+
+                # City / location
+                loc_el = card.select_one("div.product_details span[class*='Body4R']")
+                location_text = self._clean(loc_el.get_text()) if loc_el else ""
+                # Remove the svg-related text noise; keep last token as city guess
+                if location_text:
+                    location_text = location_text.replace("Made in India", "").strip()
+
+                # Business type
+                business_type = ""
+                for p in card.select("div.product_details p"):
+                    pt = self._clean(p.get_text())
+                    if pt.startswith("Business Type"):
+                        business_type = pt.replace("Business Type:", "").strip()
+                        break
+
+                if comp_link:
+                    profile_links.append((name, comp_href))
+
+                result.companies.append(ExtractedCompany(
+                    company_name=name,
+                    address=location_text,
+                    city=city or location_text.split()[-1] if location_text else city,
+                    state=state,
+                    source="tradeindia",
+                    source_url=url,
+                    confidence=60,
+                    industry=self._guess_industry(query),
+                    crawl_timestamp=datetime.now(timezone.utc).isoformat(),
+                ))
+
+            # Second pass: visit company profile pages to extract contact details
+            for cname, purl in profile_links[:5]:
+                try:
+                    html2 = await self._pw_goto(page, purl)
+                    if not html2:
                         continue
-                    name = self._clean(name_el.get_text())
-                    if not name or len(name) < 3 or name.lower() in seen:
-                        continue
-                    seen.add(name.lower())
+                    soup2 = BeautifulSoup(html2, "lxml")
+                    p_email, p_phone, p_website = "", "", ""
 
-                    # Collect profile link from card
-                    link_el = (
-                        card.select_one("a[href*='tradeindia.com']") or
-                        card.select_one("a[href]")
-                    )
-                    if link_el:
-                        href = link_el.get("href", "")
-                        if re.search(r'-\d+/$', href) and "tradeindia.com" in href:
-                            profile_links.append((name, href))
-
-                    website = ""
-                    website_el = card.select_one("a[href*='http'][href*='.com'], a[href*='http'][href*='.in']")
-                    if website_el:
-                        href = website_el.get("href", "")
-                        if "tradeindia.com" not in href:
-                            website = href
-
-                    phone = ""
-                    phone_el = (
-                        card.select_one("a[href^='tel:']") or
-                        card.select_one("span[class*='phone']") or
-                        card.select_one("[class*='mob']")
-                    )
-                    if phone_el:
-                        phone_text = phone_el.get_text() if phone_el.name != "a" else phone_el.get("href", "")
-                        phone = re.sub(r"[^\d]", "", phone_text)
-                        if len(phone) < 10:
-                            phone = ""
-
-                    location_text = ""
-                    loc_el = (
-                        card.select_one("[class*='loc']") or
-                        card.select_one("span[class*='city']") or
-                        card.select_one("[class*='address']")
-                    )
-                    if loc_el:
-                        location_text = self._clean(loc_el.get_text())
-
-                    result.companies.append(ExtractedCompany(
-                        company_name=name,
-                        website=website,
-                        phone=phone,
-                        address=location_text,
-                        city=city,
-                        state=state,
-                        source="tradeindia",
-                        source_url=url,
-                        confidence=60,
-                        industry=self._guess_industry(query),
-                        crawl_timestamp=datetime.now(timezone.utc).isoformat(),
-                    ))
-
-                # Fallback: try the old regex approach for links
-                if not result.companies:
-                    for a in soup.find_all('a', href=True):
-                        text = a.get_text(strip=True)
-                        if not text or len(text) < 10:
-                            continue
-                        m = re.match(r'^(.+?)((?:Navi\s+)?(?:Mumbai|Delhi|Bangalore|Bengaluru|Chennai|Kolkata|Hyderabad|Pune|Ahmedabad|Surat|Lucknow|Jaipur|Ludhiana|Vadodara|Rajkot|Gurugram|Indore|Bhopal|Chandigarh|Nagpur|Thane|Nashik|Agra|Meerut|Faridabad|Ghaziabad|Patna|Srinagar|Kanpur|Kochi|Visakhapatnam|Vijayawada|Madurai|Coimbatore|Thiruvananthapuram|Guwahati)),\s*India$', text)
-                        if not m:
-                            continue
-                        name = self._clean(m.group(1))
-                        loc = self._clean(m.group(2))
-                        if name.lower() in seen:
-                            continue
-                        seen.add(name.lower())
-                        result.companies.append(ExtractedCompany(
-                            company_name=name, city=loc or city, state=state,
-                            source="tradeindia", source_url=url, confidence=60,
-                            industry=self._guess_industry(query),
-                            crawl_timestamp=datetime.now(timezone.utc).isoformat(),
-                        ))
-
-                # Second pass: visit company profile pages to extract contact details
-                if profile_links:
-                    for idx, (cname, purl) in enumerate(profile_links[:5]):
-                        try:
-                            html2 = await self._pw_goto(page, purl)
-                            if not html2:
-                                continue
-                            soup2 = BeautifulSoup(html2, "lxml")
-                            p_email, p_phone, p_website = "", "", ""
-
-                            # Click "Show Contact" / "Email" buttons if present
+                    # Click "Show Contact" / "Email" / "View Number" buttons
+                    try:
+                        btns = await page.query_selector_all("button, a")
+                        for btn in btns:
                             try:
-                                btns = await page.query_selector_all("button, a")
-                                for btn in btns:
-                                    txt = (await btn.inner_text()).lower()
-                                    if any(x in txt for x in ["show contact", "email", "get email", "view contact", "show number"]):
-                                        await btn.click()
-                                        await asyncio.sleep(1)
+                                txt = (await btn.inner_text()).lower()
+                                if any(x in txt for x in ["show contact", "email", "get email", "view contact", "show number", "call now", "send inquiry"]):
+                                    await btn.click()
+                                    await asyncio.sleep(1)
                             except Exception:
-                                pass
+                                continue
+                    except Exception:
+                        pass
 
-                            fresh_html = await page.content()
-                            soup2 = BeautifulSoup(fresh_html, "lxml")
+                    fresh_html = await page.content()
+                    soup2 = BeautifulSoup(fresh_html, "lxml")
 
-                            # Extract emails from rendered page
-                            for a_tag in soup2.find_all("a", href=True):
-                                h = a_tag.get("href", "")
-                                if h.startswith("mailto:"):
-                                    p_email = h.replace("mailto:", "").strip()
-                                    break
-                            if not p_email:
-                                for t in soup2.find_all(string=re.compile(r'[\w.+-]+@[\w-]+\.[\w.]+')):
-                                    p_email = t.strip()
-                                    break
+                    for a_tag in soup2.find_all("a", href=True):
+                        h = a_tag.get("href", "")
+                        if h.startswith("mailto:"):
+                            p_email = h.replace("mailto:", "").strip()
+                            break
+                    if not p_email:
+                        for t in soup2.find_all(string=re.compile(r"[\w.+-]+@[\w-]+\.[\w.]+")):
+                            p_email = t.strip()
+                            break
 
-                            # Extract phone
-                            for a_tag in soup2.find_all("a", href=True):
-                                h = a_tag.get("href", "")
-                                if h.startswith("tel:"):
-                                    digits = re.sub(r"[^\d]", "", h)
-                                    if len(digits) >= 10:
-                                        p_phone = digits
-                                        break
+                    for a_tag in soup2.find_all("a", href=True):
+                        h = a_tag.get("href", "")
+                        if h.startswith("tel:"):
+                            digits = re.sub(r"[^\d]", "", h)
+                            if len(digits) >= 10:
+                                p_phone = digits
+                                break
 
-                            # Extract website
-                            for a_tag in soup2.find_all("a", href=True):
-                                h = a_tag.get("href", "")
-                                if h.startswith("http") and "tradeindia.com" not in h:
-                                    p_website = h.rstrip("/")
-                                    break
+                    for a_tag in soup2.find_all("a", href=True):
+                        h = a_tag.get("href", "")
+                        if h.startswith("http") and "tradeindia.com" not in h:
+                            p_website = h.rstrip("/")
+                            break
 
-                            # Update the matching company in result
-                            for c in result.companies:
-                                if c.company_name.lower() == cname.lower():
-                                    if p_email and not c.email:
-                                        c.email = p_email
-                                    if p_phone and not c.phone:
-                                        c.phone = p_phone
-                                    if p_website and not c.website:
-                                        c.website = p_website
-                                    break
-                        except Exception:
-                            continue
+                    for c in result.companies:
+                        if c.company_name.lower() == cname.lower():
+                            if p_email and not c.email:
+                                c.email = p_email
+                            if p_phone and not c.phone:
+                                c.phone = p_phone
+                            if p_website and not c.website:
+                                c.website = p_website
+                            break
+                except Exception as e:
+                    logger.warning(f"TradeIndia profile visit failed for {purl}: {e}")
+                    continue
 
-                result.pages_crawled = 1 if result.companies else 0
+            result.pages_crawled = 1 if result.companies else 0
+            logger.info(f"TradeIndia: {len(result.companies)} companies from {url}")
             await ctx.close()
         except Exception as e:
+            logger.warning(f"TradeIndia crawl failed: {e}")
             result.errors.append(f"tradeindia: {e}")
         return result
 
@@ -628,18 +602,23 @@ class MultiSourceCrawler:
             city = "Mumbai"
         try:
             page, ctx = await self._pw_page()
-            slug = query.lower().replace(" ", "-")
-            url = f"https://www.justdial.com/{city}/{slug}"
+            city_slug = city.lower().replace(" ", "-")
+            q_slug = query.lower().replace(" ", "-")
+            url = f"https://www.justdial.com/{city_slug}/{q_slug}"
             html = await self._pw_goto(page, url)
+            if not html:
+                # Fallback: use the search endpoint
+                url = f"https://www.justdial.com/{city_slug}/search?q={quote_plus(query)}"
+                html = await self._pw_goto(page, url)
             if html:
                 soup = BeautifulSoup(html, "lxml")
                 seen = set()
-                for listing in soup.select("div.resultbox_info, li.cntanr, div.feedrc, section.search-result, div[class*='result'], li[class*='cnt']"):
-                    name = self._clean(listing.select_one("h2 a, span.resultbox_name, span[class*='name']"))
+                for listing in soup.select("div.resultbox_info, li.cntanr, div.feedrc, section.search-result, div[class*='result'], li[class*='cnt'], div.storelist"):
+                    name = self._clean(listing.select_one("h2 a, span.resultbox_name, span[class*='name'], h3 a, a[class*='name']"))
                     if not name or len(name) < 3 or name.lower() in seen:
                         continue
                     seen.add(name.lower())
-                    location = self._clean(listing.select_one("span.resultbox_address, span.locality, span[class*='address']"))
+                    location = self._clean(listing.select_one("span.resultbox_address, span.locality, span[class*='address'], div[class*='addr']"))
                     phone_el = listing.select_one("span.mobilesv, span[class*='phone'], a[href^='tel:']")
                     phone = re.sub(r"[^\d]", "", phone_el.get_text()) if phone_el else ""
                     result.companies.append(ExtractedCompany(
@@ -690,18 +669,21 @@ class MultiSourceCrawler:
     async def crawl_yellowpages(self, query: str, city: str = "", state: str = "") -> CrawlResult:
         result = CrawlResult()
         try:
-            url = f"https://www.yellowpages.com/search?search_terms={quote_plus(query)}&geo_location_terms={quote_plus(city) if city else 'India'}"
+            url = f"https://www.yellowpages.co.in/search?search_terms={quote_plus(query)}&geo_location_terms={quote_plus(city) if city else 'India'}"
             html = await self._fetch(url)
+            if not html:
+                url = f"https://www.yellowpages.co.in/{city}/{query}".replace(" ", "-") if city else f"https://www.yellowpages.co.in/search?search_terms={quote_plus(query)}"
+                html = await self._fetch(url)
             if html:
                 soup = BeautifulSoup(html, "lxml")
                 seen = set()
-                for card in soup.select("div.result, div.search-result, div.business-card, div[class*='result'], div[class*='business']"):
-                    name = self._clean(card.select_one("h2 a, a.business-name, span[class*='name'], a[class*='name']"))
+                for card in soup.select("div.result, div.search-result, div.business-card, div[class*='result'], div[class*='business'], div.listing, li.listing"):
+                    name = self._clean(card.select_one("h2 a, a.business-name, span[class*='name'], a[class*='name'], h3 a"))
                     if not name or len(name) < 3 or name.lower() in seen:
                         continue
                     seen.add(name.lower())
-                    phone = self._clean(card.select_one("div.phone, span[class*='phone']"))
-                    location = self._clean(card.select_one("div.locality, div.street-address, span[class*='addr']"))
+                    phone = self._clean(card.select_one("div.phone, span[class*='phone'], a[href^='tel:']"))
+                    location = self._clean(card.select_one("div.locality, div.street-address, span[class*='addr'], p[class*='addr']"))
                     website_el = card.select_one("a[href*='http']")
                     website = website_el.get("href", "") if website_el else ""
                     result.companies.append(ExtractedCompany(

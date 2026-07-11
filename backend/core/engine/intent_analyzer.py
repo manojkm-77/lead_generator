@@ -228,7 +228,7 @@ class IntentAnalyzer:
         if words:
             return words[0], []
 
-        return raw_query, []
+        return query, []
 
     def _extract_business_type(self, query: str) -> tuple[str, list[str]]:
         """Extract business role from query."""

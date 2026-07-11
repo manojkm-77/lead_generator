@@ -1,6 +1,7 @@
 # Scrapy
 Scrapy==2.16.0
 scrapy-playwright==0.0.47
+playwright==1.49.0
 
 # FastAPI
 fastapi==0.115.6

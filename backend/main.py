@@ -5,11 +5,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from backend.config import get_settings
-from backend.database import init_db
 from backend.core.database import init_v2_db
-from backend.api.routes import router
-from backend.api.crm_routes import router as crm_router
-from backend.api.intelligence_routes import router as intel_router
 from backend.api.v2_routes import router as v2_router
 from backend.infrastructure.redis import get_redis, close_redis
 from backend.infrastructure.sse import get_sse_publisher
@@ -26,7 +22,6 @@ logging.basicConfig(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await init_db()
     await init_v2_db()
     await get_redis()
 
@@ -69,9 +64,6 @@ app.add_middleware(
     allow_headers=["Authorization", "Content-Type"],
 )
 
-app.include_router(router, prefix="/api")
-app.include_router(crm_router, prefix="/api")
-app.include_router(intel_router, prefix="/api")
 app.include_router(v2_router, prefix="/api/v2")
 
 

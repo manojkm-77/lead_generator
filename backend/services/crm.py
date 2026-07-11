@@ -133,12 +133,8 @@ class CRMService:
                 Company.company_name.ilike(f"%{search}%")
             )
         if has_followup:
-            if has_followup:
-                query = query.where(Lead.next_followup.isnot(None))
-                count_query = count_query.where(Lead.next_followup.isnot(None))
-            else:
-                query = query.where(Lead.next_followup.is_(None))
-                count_query = count_query.where(Lead.next_followup.is_(None))
+            query = query.where(Lead.next_followup.isnot(None))
+            count_query = count_query.where(Lead.next_followup.isnot(None))
 
         total = (await db.execute(count_query)).scalar() or 0
 

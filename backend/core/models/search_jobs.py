@@ -7,6 +7,7 @@ relationships for expanded queries, and geography targeting.
 """
 
 import enum
+import json
 from datetime import datetime, timezone
 
 from sqlalchemy import (
@@ -14,8 +15,24 @@ from sqlalchemy import (
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.types import TypeDecorator
 
 from backend.core.database import V2Base
+
+
+class _JsonText(TypeDecorator):
+    impl = Text
+    cache_ok = True
+
+    def process_bind_param(self, value, dialect):
+        if value is None:
+            return None
+        return json.dumps(value)
+
+    def process_result_value(self, value, dialect):
+        if value is None:
+            return None
+        return json.loads(value)
 
 
 class JobStatus(str, enum.Enum):
@@ -74,7 +91,7 @@ class SearchJob(V2Base):
     companies_found: Mapped[int] = mapped_column(Integer, default=0)
     contacts_found: Mapped[int] = mapped_column(Integer, default=0)
     errors: Mapped[dict | None] = mapped_column(
-        JSONB().with_variant(Text, "sqlite")
+        JSONB().with_variant(_JsonText(), "sqlite")
     )
 
     # Geography

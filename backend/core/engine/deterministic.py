@@ -125,7 +125,12 @@ class DeterministicMatrix:
 
         # Business type variations
         btype = intent.business_type
-        if btype in TYPE_SUFFIXES:
+        query_type = intent.query_type
+
+        # Service queries (hotels, restaurants) — no business suffix needed
+        if query_type == "service_search":
+            bt_variants = [""]
+        elif btype in TYPE_SUFFIXES:
             bt_variants = TYPE_SUFFIXES[btype][:4]
         elif btype:
             bt_variants = [btype]
@@ -143,7 +148,7 @@ class DeterministicMatrix:
         for prod in product_terms[:5]:
             for bt in bt_variants:
                 for loc in locations:
-                    q_str = f"{prod} {bt}"
+                    q_str = f"{prod} {bt}".strip()
                     if loc:
                         q_str += f" {loc}"
 
@@ -152,7 +157,7 @@ class DeterministicMatrix:
                     local_counter += 1
                     priority = SOURCE_CONFIGS[source]["priority"]
 
-                    label = f"{prod} {bt}"
+                    label = f"{prod} {bt}".strip()
                     if loc:
                         label += f" in {loc}"
 
