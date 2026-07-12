@@ -27,19 +27,29 @@ def _is_sqlite(url) -> bool:
     return str(url).startswith("sqlite") or str(url).startswith("sqlite+aiosqlite")
 
 
+def _normalize_db_url(url) -> str:
+    url = str(url)
+    if url.startswith("postgresql://") or url.startswith("postgres://"):
+        return url.replace("postgresql://", "postgresql+asyncpg://", 1).replace("postgres://", "postgresql+asyncpg://", 1)
+    if url.startswith("mysql://"):
+        return url.replace("mysql://", "mysql+aiomysql://", 1)
+    return url
+
+
 def get_engine():
     global _engine
     if _engine is not None:
         return _engine
 
     settings = get_settings()
+    database_url = _normalize_db_url(settings.database_url)
     kwargs = {"echo": settings.debug}
-    if not _is_sqlite(settings.database_url):
+    if not _is_sqlite(database_url):
         kwargs["pool_size"] = 20
         kwargs["max_overflow"] = 10
         kwargs["pool_pre_ping"] = True
 
-    _engine = create_async_engine(settings.database_url, **kwargs)
+    _engine = create_async_engine(database_url, **kwargs)
     return _engine
 
 
