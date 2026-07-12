@@ -45,17 +45,13 @@ export default function CrawlForm() {
         });
         setResult({ type: "success", message: `Started ${selectedSpiders[0]}` });
       } else {
-        const resp = await fetch("/api/crawl/multi", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            spiders: selectedSpiders,
-            queries: keywords.split(",").map((k) => k.trim()).filter(Boolean),
-            max_pages: maxPages,
-          }),
+        const resp = await startCrawl({
+          query: keywords.split(",").map((k) => k.trim()).filter(Boolean).join(" "),
+          source: "crawl_form",
+          max_pages: maxPages,
+          metadata: { spiders: selectedSpiders },
         });
-        const data = await resp.json();
-        setResult({ type: "success", message: data.message || `Started ${selectedSpiders.length} spiders` });
+        setResult({ type: "success", message: resp.data?.message || `Started ${selectedSpiders.length} spiders` });
       }
     } catch (err) {
       setResult({ type: "error", message: err.response?.data?.detail || err.message });

@@ -57,13 +57,17 @@ app.add_middleware(
         "http://localhost:5180",
         "http://localhost:3000",
         "http://localhost:80",
+        "http://127.0.0.1:5173",
+        "http://127.0.0.1:5180",
+        "http://127.0.0.1:3000",
+        "http://127.0.0.1:80",
         "https://*.vercel.app",
         "https://*.onrender.com",
         "https://*.railway.app",
     ],
     allow_origin_regex=r"https://.*\.(vercel\.app|onrender\.com|railway\.app)$",
     allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type"],
 )
 
