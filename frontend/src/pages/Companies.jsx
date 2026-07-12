@@ -1,7 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { Link } from "react-router-dom";
 import { getCompanies, getStats, exportLeads } from "../api/client";
-import { convertToLead } from "../api/crm";
 
 function ScoreBadge({ score }) {
   let color = "bg-gray-100 text-gray-600 dark:bg-dark-700 dark:text-gray-400";
@@ -147,15 +146,6 @@ export default function Companies() {
       a.click();
     } catch (err) {
       alert("Export failed");
-    }
-  };
-
-  const handleConvert = async (companyId) => {
-    try {
-      await convertToLead(companyId);
-      fetchCompanies();
-    } catch (err) {
-      alert(err.response?.data?.detail || "Failed to convert");
     }
   };
 
@@ -373,12 +363,6 @@ export default function Companies() {
                         <Link to={`/company/${c.id}`} className="text-xs text-brand-600 hover:text-brand-700 font-medium px-2 py-1 rounded hover:bg-brand-50 dark:hover:bg-brand-900/20">
                           View
                         </Link>
-                        <button
-                          onClick={() => handleConvert(c.id)}
-                          className="text-xs text-gray-500 hover:text-green-600 font-medium px-2 py-1 rounded hover:bg-green-50 dark:hover:bg-green-900/20"
-                        >
-                          +Lead
-                        </button>
                       </div>
                     </td>
                   </tr>
