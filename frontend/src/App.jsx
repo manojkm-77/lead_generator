@@ -20,6 +20,7 @@ function App() {
         <Route path="/company/:id" element={<CompanyView />} />
         <Route path="/crawls" element={<CrawlHistory />} />
         <Route path="/crm/pipeline" element={<Pipeline />} />
+        <Route path="/discovery" element={<Pipeline />} />
         <Route path="/analytics" element={<TradeAnalytics />} />
         <Route path="/exports" element={<Exports />} />
         <Route path="/settings" element={<Settings />} />
