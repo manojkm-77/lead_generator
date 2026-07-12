@@ -37,6 +37,9 @@ export const classifyLeads = (params) => api.post("/search", { query: "classify"
 export const exportLeads = (format, params) =>
   api.post(`/export`, null, { params: { format, ...params }, responseType: "blob" });
 
+export const exportData = (params) =>
+  api.post(`/export`, null, { params });
+
 // ── Stats ────────────────────────────────────────────────────────────────────
 export const getStats = () => api.get("/stats");
 
