@@ -81,7 +81,7 @@ async def root():
 
 @app.get("/health")
 async def health():
-    return {"status": "healthy"}
+    return {"status": "ok", "service": "BuyerHunter AI", "version": "1.0.0"}
 
 
 if __name__ == "__main__":

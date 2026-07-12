@@ -195,7 +195,7 @@ def _contact_to_frontend(ct: Contact) -> dict:
 
 @router.get("/health")
 async def health():
-    return {"status": "healthy", "version": "2.0.0", "engine": "v2"}
+    return {"status": "ok", "service": "BuyerHunter AI", "version": "2.0.0", "engine": "v2"}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
